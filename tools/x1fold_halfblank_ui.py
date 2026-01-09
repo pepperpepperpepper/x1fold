@@ -518,6 +518,12 @@ def main(argv: list[str]) -> int:
         help="Minimum time between applying XRandR rotations from sensors (default: 1.0).",
     )
     p.add_argument(
+        "--x11-auto-rotate-stable-s",
+        type=float,
+        default=0.0,
+        help="Require sensor orientation to be stable for this many seconds before applying a rotation (default: 0.0).",
+    )
+    p.add_argument(
         "--x11-force-normal-when-half",
         action="store_true",
         help="Force XRandR rotation to 'normal' while halfblank is active (default: off).",
@@ -581,6 +587,7 @@ def main(argv: list[str]) -> int:
     wl_blanker = WaylandBlanker()
     last_sensor_check = 0.0
     last_sensor_orientation: str | None = None
+    last_sensor_orientation_change = 0.0
     last_x11_rotate_apply = 0.0
     if args.x11_auto_rotate:
         _sensorproxy_claim()
@@ -686,7 +693,15 @@ def main(argv: list[str]) -> int:
                 last_sensor_check = now
                 ori = _sensorproxy_orientation()
                 if ori:
-                    last_sensor_orientation = ori
+                    if ori != last_sensor_orientation:
+                        last_sensor_orientation = ori
+                        stable_s = float(args.x11_auto_rotate_stable_s or 0.0)
+                        if last_sensor_orientation_change == 0.0 and stable_s > 0:
+                            # Treat the first reading as already stable to avoid
+                            # adding latency at startup unless requested.
+                            last_sensor_orientation_change = now - stable_s
+                        else:
+                            last_sensor_orientation_change = now
                 target_rot = _sensorproxy_to_xrandr_rotation(ori) if ori else None
                 target_rot_reason = "sensor"
         rotated = False
@@ -706,28 +721,10 @@ def main(argv: list[str]) -> int:
                     min_apply_s=min_apply_s,
                 )
             else:
-                rot_start = time.monotonic()
-                ok, err = _x11_set_rotation(x11_display, output, target_rot)
-                rot_elapsed_s = round(time.monotonic() - rot_start, 3)
-                if ok:
+                stable_s = float(args.x11_auto_rotate_stable_s or 0.0)
+                if target_rot_reason == "sensor" and stable_s > 0 and (now - last_sensor_orientation_change) < stable_s:
                     _log(
-                        "x11_rotated",
-                        display=x11_display,
-                        output=output,
-                        from_rotation=rotation,
-                        rotation=target_rot,
-                        sensor_orientation=last_sensor_orientation,
-                        docked=docked,
-                        desired=desired,
-                        elapsed_s=rot_elapsed_s,
-                        reason=target_rot_reason,
-                    )
-                    rotation = target_rot
-                    rotated = True
-                    last_x11_rotate_apply = time.monotonic()
-                else:
-                    _log(
-                        "x11_rotate_failed",
+                        "x11_rotate_debounced",
                         display=x11_display,
                         output=output,
                         from_rotation=rotation,
@@ -735,10 +732,43 @@ def main(argv: list[str]) -> int:
                         sensor_orientation=last_sensor_orientation,
                         docked=docked,
                         desired=desired,
-                        error=err,
-                        elapsed_s=rot_elapsed_s,
-                        reason=target_rot_reason,
+                        since_change_s=round(now - last_sensor_orientation_change, 3),
+                        stable_s=stable_s,
                     )
+                else:
+                    rot_start = time.monotonic()
+                    ok, err = _x11_set_rotation(x11_display, output, target_rot)
+                    rot_elapsed_s = round(time.monotonic() - rot_start, 3)
+                    if ok:
+                        _log(
+                            "x11_rotated",
+                            display=x11_display,
+                            output=output,
+                            from_rotation=rotation,
+                            rotation=target_rot,
+                            sensor_orientation=last_sensor_orientation,
+                            docked=docked,
+                            desired=desired,
+                            elapsed_s=rot_elapsed_s,
+                            reason=target_rot_reason,
+                        )
+                        rotation = target_rot
+                        rotated = True
+                        last_x11_rotate_apply = time.monotonic()
+                    else:
+                        _log(
+                            "x11_rotate_failed",
+                            display=x11_display,
+                            output=output,
+                            from_rotation=rotation,
+                            desired_rotation=target_rot,
+                            sensor_orientation=last_sensor_orientation,
+                            docked=docked,
+                            desired=desired,
+                            error=err,
+                            elapsed_s=rot_elapsed_s,
+                            reason=target_rot_reason,
+                        )
 
         # After rotation, map the touchscreen/pen devices to the output so the
         # digitizer coordinates track the new orientation.
