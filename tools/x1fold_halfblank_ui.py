@@ -56,6 +56,136 @@ def _xrandr(display: str, argv: list[str]) -> subprocess.CompletedProcess[str]:
     env["DISPLAY"] = display
     return subprocess.run(["xrandr", *argv], check=False, capture_output=True, text=True, env=env)
 
+def _x11_output_rotation(display: str, output: str) -> str | None:
+    proc = _xrandr(display, ["--query"])
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        if not line.startswith(output + " "):
+            continue
+        if " connected" not in line:
+            continue
+        # Example: "(normal left inverted right x axis y axis)"
+        m = re.search(r"\((normal|left|right|inverted)\b", line)
+        if not m:
+            return None
+        return m.group(1)
+    return None
+
+
+def _x11_set_rotation(display: str, output: str, rotation: str) -> tuple[bool, str]:
+    if rotation not in {"normal", "left", "right", "inverted"}:
+        return False, f"invalid rotation: {rotation}"
+    proc = _xrandr(display, ["--output", output, "--rotate", rotation])
+    if proc.returncode == 0:
+        return True, ""
+    msg = (proc.stderr or proc.stdout).strip() or f"xrandr failed (rc={proc.returncode})"
+    return False, msg
+
+
+def _sensorproxy_claim() -> None:
+    try:
+        subprocess.run(
+            [
+                "busctl",
+                "--system",
+                "call",
+                "net.hadess.SensorProxy",
+                "/net/hadess/SensorProxy",
+                "net.hadess.SensorProxy",
+                "ClaimAccelerometer",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return
+
+
+def _sensorproxy_orientation() -> str | None:
+    """
+    Read iio-sensor-proxy's AccelerometerOrientation, e.g. "normal", "left-up".
+
+    Returns None on failure or if no orientation is available.
+    """
+
+    try:
+        proc = subprocess.run(
+            [
+                "busctl",
+                "--system",
+                "get-property",
+                "net.hadess.SensorProxy",
+                "/net/hadess/SensorProxy",
+                "net.hadess.SensorProxy",
+                "AccelerometerOrientation",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    m = re.search(r"\"([^\"]*)\"", proc.stdout)
+    if not m:
+        return None
+    s = m.group(1).strip()
+    return s or None
+
+
+def _sensorproxy_to_xrandr_rotation(orientation: str) -> str | None:
+    # iio-sensor-proxy -> XRandR rotation mapping:
+    # - "left-up"  means the device left edge is up -> rotate output left
+    # - "right-up" means the device right edge is up -> rotate output right
+    # - "bottom-up" means device is upside down -> inverted
+    mapping = {"normal": "normal", "left-up": "left", "right-up": "right", "bottom-up": "inverted"}
+    return mapping.get(orientation)
+
+def _xinput_list(display: str) -> list[tuple[int, str]]:
+    env = dict(os.environ)
+    env["DISPLAY"] = display
+    try:
+        proc = subprocess.run(["xinput", "list", "--short"], check=False, capture_output=True, text=True, env=env)
+    except OSError:
+        return []
+    if proc.returncode != 0:
+        return []
+    out: list[tuple[int, str]] = []
+    for line in proc.stdout.splitlines():
+        m = re.search(r"\bid=(\d+)\b", line)
+        if not m:
+            continue
+        try:
+            dev_id = int(m.group(1))
+        except ValueError:
+            continue
+        name = line.split("\t")[0].strip()
+        if name:
+            out.append((dev_id, name))
+    return out
+
+
+def _xinput_map_to_output(display: str, dev_id: int, output: str) -> tuple[bool, str]:
+    env = dict(os.environ)
+    env["DISPLAY"] = display
+    try:
+        proc = subprocess.run(
+            ["xinput", "map-to-output", str(int(dev_id)), str(output)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if proc.returncode == 0:
+        return True, ""
+    msg = (proc.stderr or proc.stdout).strip() or f"xinput failed (rc={proc.returncode})"
+    return False, msg
+
 
 def _x11_pick_output(display: str, preferred: str | None) -> str | None:
     if preferred:
@@ -125,16 +255,34 @@ def _x11_del_monitor(display: str, *, name: str) -> tuple[bool, str]:
     return False, msg or f"xrandr failed (rc={proc.returncode})"
 
 
-def _x11_set_monitor(display: str, *, name: str, output: str, target_h: int) -> tuple[bool, str]:
+def _x11_set_monitor_rect(
+    display: str,
+    *,
+    name: str,
+    output: str,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+) -> tuple[bool, str]:
     _x11_del_monitor(display, name=name)
     geom = _x11_monitor_geometry(display, output)
     if not geom:
         return False, "failed to parse xrandr --listmonitors"
     w_px, w_mm, full_h, full_mm = geom
-    if target_h <= 0 or target_h > full_h:
-        return False, f"target height must be in 1..{full_h}"
-    target_mm = max(1, int(round(full_mm * (target_h / full_h))))
-    geometry = f"{w_px}/{w_mm}x{target_h}/{target_mm}+0+0"
+    full_w = w_px
+    full_h_px = full_h
+
+    if w <= 0 or h <= 0:
+        return False, "rect width/height must be > 0"
+    if x < 0 or y < 0:
+        return False, "rect x/y must be >= 0"
+    if x + w > full_w or y + h > full_h_px:
+        return False, f"rect out of range (full={full_w}x{full_h_px})"
+
+    target_w_mm = max(1, int(round(w_mm * (w / full_w))))
+    target_h_mm = max(1, int(round(full_mm * (h / full_h_px))))
+    geometry = f"{w}/{target_w_mm}x{h}/{target_h_mm}+{x}+{y}"
     proc = _xrandr(display, ["--setmonitor", name, geometry, output])
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout).strip() or f"xrandr failed (rc={proc.returncode})"
@@ -145,13 +293,27 @@ def _x11_set_monitor(display: str, *, name: str, output: str, target_h: int) -> 
 class X11Blanker:
     def __init__(self) -> None:
         self.proc: subprocess.Popen[str] | None = None
+        self.key: tuple[str, str, int, str] | None = None  # (helper, display, active_size, side)
 
-    def ensure(self, *, helper: str, display: str, top_height: int, name: str) -> tuple[bool, str]:
-        if self.proc and self.proc.poll() is None:
+    def ensure(self, *, helper: str, display: str, active_size: int, side: str, name: str) -> tuple[bool, str]:
+        key = (helper, display, int(active_size), str(side))
+        if self.proc and self.proc.poll() is None and self.key == key:
             return True, ""
+        self.stop()
+        self.key = key
         try:
             self.proc = subprocess.Popen(
-                [helper, "--display", display, "--top-height", str(int(top_height)), "--name", name],
+                [
+                    helper,
+                    "--display",
+                    display,
+                    "--side",
+                    str(side),
+                    "--active-size",
+                    str(int(active_size)),
+                    "--name",
+                    name,
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -172,6 +334,7 @@ class X11Blanker:
             return
         if self.proc.poll() is not None:
             self.proc = None
+            self.key = None
             return
         self.proc.terminate()
         try:
@@ -180,6 +343,7 @@ class X11Blanker:
             self.proc.kill()
             self.proc.wait(timeout=2.0)
         self.proc = None
+        self.key = None
 
 
 def _read_state(path: Path) -> dict[str, Any] | None:
@@ -209,7 +373,7 @@ def _apply_x11(
     display: str,
     output: str,
     helper: str,
-    top_height: int,
+    active_size: int,
     name: str,
     monitor_name: str,
     setmonitor: bool,
@@ -222,11 +386,18 @@ def _apply_x11(
             _log("x11_fb_set_failed", display=display, output=output, error=err)
 
     if desired == "half":
+        if not mode:
+            return False, "failed to read current mode"
+        w, h = mode
+        # Halfblank is defined as "top region active, bottom region unused".
+        if int(active_size) <= 0 or int(active_size) >= int(h):
+            return False, "active_size must be in 1..(screen_height-1)"
+        ax, ay, aw, ah = (0, 0, int(w), int(active_size))
         if setmonitor:
-            ok, err = _x11_set_monitor(display, name=monitor_name, output=output, target_h=top_height)
+            ok, err = _x11_set_monitor_rect(display, name=monitor_name, output=output, x=ax, y=ay, w=aw, h=ah)
             if not ok:
                 _log("x11_setmonitor_failed", display=display, output=output, monitor=monitor_name, error=err)
-        return blanker.ensure(helper=helper, display=display, top_height=top_height, name=name)
+        return blanker.ensure(helper=helper, display=display, active_size=active_size, side="bottom", name=name)
     if setmonitor:
         ok, err = _x11_del_monitor(display, name=monitor_name)
         if not ok:
@@ -246,11 +417,46 @@ def main(argv: list[str]) -> int:
     p.add_argument("--interval-s", type=float, default=0.2, help="Poll interval for state changes (default: 0.2).")
     p.add_argument("--x11-output", default="", help="XRandR output override (default: auto pick eDP-*).")
     p.add_argument(
+        "--x11-auto-rotate",
+        action="store_true",
+        help="Auto-rotate XRandR output based on iio-sensor-proxy (default: off).",
+    )
+    p.add_argument(
+        "--x11-auto-rotate-interval-s",
+        type=float,
+        default=0.5,
+        help="Polling interval for iio-sensor-proxy orientation (default: 0.5).",
+    )
+    p.add_argument(
+        "--x11-force-normal-when-half",
+        action="store_true",
+        help="Force XRandR rotation to 'normal' while halfblank is active (default: off).",
+    )
+    p.add_argument(
+        "--x11-xinput-regex",
+        default=r"WACF2200|Wacom|Touchscreen",
+        help="Regex for xinput devices to map after rotation (default: WACF2200|Wacom|Touchscreen).",
+    )
+    p.add_argument(
+        "--no-x11-xinput-map",
+        dest="x11_xinput_map",
+        action="store_false",
+        help="Disable xinput map-to-output after rotation.",
+    )
+    p.set_defaults(x11_xinput_map=True)
+    p.add_argument(
         "--x11-monitor-name",
         default="X1FOLD_TOP",
         help="XRandR monitor object name to advertise top-only geometry (default: X1FOLD_TOP).",
     )
-    p.add_argument("--top-height", type=int, default=1240, help="Top (active) height for half mode (default: 1240).")
+    p.add_argument(
+        "--active-size",
+        "--top-height",
+        dest="active_size",
+        type=int,
+        default=1240,
+        help="Active size in pixels for half mode (default: 1240). For sideways/rotated use, this becomes active width.",
+    )
     p.add_argument(
         "--x11-blank-helper",
         default="x1fold_x11_blank",
@@ -261,41 +467,36 @@ def main(argv: list[str]) -> int:
     p.add_argument("--once", action="store_true", help="Apply once and exit (useful with systemd .path units).")
     args = p.parse_args(argv)
 
-    _log("start", state_file=str(args.state_file), interval_s=args.interval_s, once=bool(args.once))
+    _log(
+        "start",
+        state_file=str(args.state_file),
+        interval_s=args.interval_s,
+        once=bool(args.once),
+        x11_auto_rotate=bool(args.x11_auto_rotate),
+    )
 
-    last_key: tuple[str | None, float | None] = (None, None)  # (desired, mtime)
+    last_key: tuple[str | None, float | None, str | None] = (None, None, None)  # (desired, mtime, rotation_applied)
     blanker = X11Blanker()
+    last_sensor_check = 0.0
+    last_sensor_orientation: str | None = None
+    if args.x11_auto_rotate:
+        _sensorproxy_claim()
 
     while True:
         st = _read_state(args.state_file)
-        if not st:
-            if args.once:
-                return 0
-            time.sleep(args.interval_s)
-            continue
+        desired = _desired_mode(st) if st else "full"
+        docked: int | None = None
+        if st and isinstance(st.get("dock"), dict):
+            d = st.get("dock") or {}
+            if isinstance(d.get("docked"), int):
+                docked = int(d.get("docked"))
 
-        desired = _desired_mode(st)
         try:
             mtime = args.state_file.stat().st_mtime
         except OSError:
             mtime = None
 
-        same_key = (desired, mtime) == last_key
         blanker_running = bool(blanker.proc and blanker.proc.poll() is None)
-        if same_key and desired == "half" and not blanker_running:
-            # State didn't change, but our helper died (or never started). Re-apply.
-            same_key = False
-        if same_key and desired == "full" and blanker_running:
-            # State didn't change, but helper is still running; clean up.
-            same_key = False
-
-        if same_key:
-            if args.once:
-                return 0
-            time.sleep(args.interval_s)
-            continue
-
-        last_key = (desired, mtime)
 
         if desired not in {"half", "full"}:
             _log("no_desired_mode", desired=desired)
@@ -320,13 +521,97 @@ def main(argv: list[str]) -> int:
             time.sleep(args.interval_s)
             continue
 
+        rotation = _x11_output_rotation(x11_display, output) or (last_key[2] or "normal")
+        now = time.monotonic()
+        target_rot: str | None = None
+        if desired == "half" and args.x11_force_normal_when_half:
+            target_rot = "normal"
+        elif args.x11_auto_rotate and desired == "full" and (docked in (0, None)):
+            if (now - last_sensor_check) >= float(args.x11_auto_rotate_interval_s):
+                last_sensor_check = now
+                ori = _sensorproxy_orientation()
+                if ori:
+                    last_sensor_orientation = ori
+                target_rot = _sensorproxy_to_xrandr_rotation(ori) if ori else None
+        rotated = False
+        if target_rot and target_rot != rotation:
+            ok, err = _x11_set_rotation(x11_display, output, target_rot)
+            if ok:
+                _log(
+                    "x11_rotated",
+                    display=x11_display,
+                    output=output,
+                    from_rotation=rotation,
+                    rotation=target_rot,
+                    sensor_orientation=last_sensor_orientation,
+                    docked=docked,
+                    desired=desired,
+                )
+                rotation = target_rot
+                rotated = True
+            else:
+                _log(
+                    "x11_rotate_failed",
+                    display=x11_display,
+                    output=output,
+                    from_rotation=rotation,
+                    desired_rotation=target_rot,
+                    sensor_orientation=last_sensor_orientation,
+                    docked=docked,
+                    desired=desired,
+                    error=err,
+                )
+
+        # After rotation, map the touchscreen/pen devices to the output so the
+        # digitizer coordinates track the new orientation.
+        if rotated and args.x11_xinput_map:
+            try:
+                rx = re.compile(str(args.x11_xinput_regex))
+            except re.error as exc:
+                _log("x11_xinput_regex_error", error=str(exc), regex=str(args.x11_xinput_regex))
+                rx = None
+            devices = _xinput_list(x11_display)
+            matched = 0
+            mapped = 0
+            for dev_id, dev_name in devices:
+                if rx and not rx.search(dev_name):
+                    continue
+                matched += 1
+                ok, err = _xinput_map_to_output(x11_display, dev_id, output)
+                if ok:
+                    mapped += 1
+                else:
+                    _log("x11_xinput_map_failed", display=x11_display, dev_id=dev_id, dev_name=dev_name, error=err)
+            if matched:
+                _log(
+                    "x11_xinput_mapped",
+                    display=x11_display,
+                    output=output,
+                    matched=matched,
+                    mapped=mapped,
+                    regex=str(args.x11_xinput_regex),
+                )
+
+        key = (desired, mtime, rotation)
+        same_key = key == last_key
+        if same_key and desired == "half" and not blanker_running:
+            same_key = False
+        if same_key and desired == "full" and blanker_running:
+            same_key = False
+        if same_key:
+            if args.once:
+                return 0
+            time.sleep(args.interval_s)
+            continue
+        last_key = key
+
         ok, err = _apply_x11(
             desired,
             blanker=blanker,
             display=x11_display,
             output=output,
             helper=str(args.x11_blank_helper),
-            top_height=int(args.top_height),
+            active_size=int(args.active_size),
             name=str(args.x11_blank_name),
             monitor_name=str(args.x11_monitor_name),
             setmonitor=not bool(args.no_x11_setmonitor),
@@ -337,10 +622,22 @@ def main(argv: list[str]) -> int:
                 desired=desired,
                 display=x11_display,
                 output=output,
+                rotation=rotation,
+                docked=docked,
+                sensor_orientation=last_sensor_orientation,
                 blank_helper=str(args.x11_blank_helper),
             )
         else:
-            _log("apply_failed", desired=desired, display=x11_display, output=output, error=err)
+            _log(
+                "apply_failed",
+                desired=desired,
+                display=x11_display,
+                output=output,
+                rotation=rotation,
+                docked=docked,
+                sensor_orientation=last_sensor_orientation,
+                error=err,
+            )
             if args.once:
                 return 1
 

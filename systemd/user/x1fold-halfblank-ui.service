@@ -6,7 +6,7 @@ Wants=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/x1fold_halfblank_ui.py --state-file /run/x1fold-halfblank/state.json
+ExecStart=/usr/local/bin/x1fold_halfblank_ui.py --state-file /run/x1fold-halfblank/state.json --x11-auto-rotate --x11-force-normal-when-half
 Restart=on-failure
 RestartSec=1
 

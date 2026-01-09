@@ -16,6 +16,7 @@ This mirrors how the platform behaves under Windows: the “halfblank” effect 
 - Applies a “top-only usable area” policy:
   - **X11:** creates a black DOCK/STRUT window over the bottom region, sets `_NET_WM_STRUT_PARTIAL` so WMs reserve that space, and constrains the cursor from entering the blank region.
   - **TTY/DRM (optional):** can clip the primary plane using an atomic commit (requires DRM master).
+  - **Orientation (optional):** under X11, can auto-rotate based on iio-sensor-proxy and remap touchscreen coordinates via `xinput map-to-output` (useful when the detachable display is rotated).
 
 ### Directory layout
 

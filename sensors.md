@@ -55,7 +55,7 @@ This is not a hardware panel-rail cut on our units; it’s an *OS-visible displa
 
 Linux implementations:
 
-- X11: `x1fold_x11_blank` draws a black region + sets `_NET_WM_STRUT_PARTIAL` and installs an XFixes pointer barrier. It also clamps the cursor back into the top region to avoid “cursor stuck in blank” UX.
+- X11: `x1fold_x11_blank` draws a black region + sets `_NET_WM_STRUT_PARTIAL` and installs an XFixes pointer barrier. It also clamps the cursor back into the active region to avoid “cursor stuck in blank” UX.
 - TTY/DRM: `drm_clip` can clip the primary plane to the top region (requires DRM master).
 
 Quick check under X11:
@@ -63,6 +63,36 @@ Quick check under X11:
 ```bash
 DISPLAY=:1 xrandr --listmonitors
 ```
+
+## 4) Device orientation (on its side)
+
+Orientation is **independent** of the dock/halfblank trigger: it changes when you rotate the detached display
+(tablet-style), and it primarily drives **display rotation + touchscreen coordinate mapping**, not halfblank.
+
+On Linux, the most portable orientation signal is the `iio-sensor-proxy` D‑Bus service:
+
+```bash
+# Returns: s "normal" | "left-up" | "right-up" | "bottom-up" | ""
+busctl --system get-property net.hadess.SensorProxy /net/hadess/SensorProxy net.hadess.SensorProxy AccelerometerOrientation
+```
+
+Mapping we use under X11 (display rotation):
+
+- iio-sensor-proxy → XRandR rotation:
+  - `normal` → `normal`
+  - `left-up` → `left`
+  - `right-up` → `right`
+  - `bottom-up` → `inverted`
+
+Implementation notes:
+
+- `x1fold_halfblank_ui.py --x11-auto-rotate` rotates the XRandR output **when undocked/full**.
+- In the provided user unit we also pass `--x11-force-normal-when-half`, so docking the keyboard snaps rotation back to
+  `normal` (laptop-like).
+- After rotating the output, it runs `xinput map-to-output` for matching touchscreen devices so digitizer
+  coordinates track the new orientation.
+- `x1fold_x11_blank` supports `--side bottom|top|left|right` + `--active-size PX`, but halfblank itself remains
+  dock-triggered; orientation updates are not.
 
 ## References
 

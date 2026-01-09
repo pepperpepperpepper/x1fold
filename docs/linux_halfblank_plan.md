@@ -42,10 +42,11 @@ Implementation options (pick the first that works on b0xx):
 1. **DRM atomic plane clip (console-safe):** keep mode at `2024x2560` but set the primary plane’s CRTC dst rect to `H=1240` (no scaling) so nothing covers the bottom region. This matches the DxgKrnl “clip bottom=1240” observation.
 2. **Actual modeset + no-scaling (desktop-friendly):** if i915 accepts a `2024x1240` mode without scaling, set it and pin it to the “top” (may require a panning/viewport trick).
 3. **X11 integration (works today on b045):** create a **black DOCK/STRUT window** that covers the bottom region.
-   - half: run `x1fold_x11_blank --top-height 1240` (creates `_NET_WM_WINDOW_TYPE_DOCK`, sets `_NET_WM_STRUT_PARTIAL` so the WM treats the bottom as reserved, and installs an XFixes pointer barrier so the cursor can’t enter the blank region)
+   - half: run `x1fold_x11_blank --side bottom --active-size 1240` (creates `_NET_WM_WINDOW_TYPE_DOCK`, sets `_NET_WM_STRUT_PARTIAL` so the WM treats the blank region as reserved, and installs an XFixes pointer barrier so the cursor can’t enter the blank region)
    - full: stop/kill the helper
-   - note: `x1fold_x11_blank` also clamps (warps) the cursor back into the top region if anything places it into the blank area, to avoid “cursor stuck in the blank part” UX.
+   - note: `x1fold_x11_blank` also clamps (warps) the cursor back into the active region if anything places it into the blank area, to avoid “cursor stuck in the blank part” UX.
    This doesn’t require DRM master (Xorg remains DRM master), yet produces a real “bottom half goes black” visual effect and a WM-usable work area that matches Windows semantics.
+   - orientation: when the detachable display is rotated “on its side”, rotate the output (and remap touchscreen coordinates) based on iio-sensor-proxy. This is separate from halfblank and should generally be active when undocked/full.
 4. **Wayland compositor integration:** when running Wayland, call the compositor’s output tool (e.g., `wlr-randr`) or compositor-specific APIs to constrain the “logical output” region to the top-half. This is less universal but gives the cleanest “Windows-like” window reflow.
 
 ## Deliverables (sustainable + installable)
