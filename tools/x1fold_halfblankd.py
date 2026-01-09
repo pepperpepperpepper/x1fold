@@ -346,6 +346,18 @@ def main(argv: list[str]) -> int:
             last = state
             if args.apply_initial:
                 desired = "half" if state.docked else "full"
+                # Write desired state immediately so UI helpers can react even if the
+                # mode-switch command itself is slow (I2C timeouts, etc.).
+                _write_json_atomic(
+                    args.state_file,
+                    {
+                        "ts": utc_iso(),
+                        "event": "apply_initial_pending",
+                        "dmi": dmi,
+                        "dock": state.__dict__,
+                        "desired": desired,
+                    },
+                )
                 rc = run_cmd(cmds.half if state.docked else cmds.full, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
                 _log("apply_initial", docked=state.docked, modeid=state.modeid, desired=desired, rc=rc)
                 _write_json_atomic(
@@ -416,6 +428,20 @@ def main(argv: list[str]) -> int:
             continue
 
         desired = "half" if state.docked else "full"
+        # Write desired state immediately so UI helpers can react even if the
+        # mode-switch command itself is slow (I2C timeouts, etc.).
+        _write_json_atomic(
+            args.state_file,
+            {
+                "ts": utc_iso(),
+                "event": "dock_change_pending",
+                "dmi": dmi,
+                "dock": state.__dict__,
+                "from_docked": last.docked,
+                "to_docked": state.docked,
+                "desired": desired,
+            },
+        )
         rc = run_cmd(cmds.half if state.docked else cmds.full, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
         _log(
             "dock_change",

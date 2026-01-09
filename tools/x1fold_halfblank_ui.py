@@ -12,7 +12,9 @@ covers the bottom part of the screen and reserves that space via
 _NET_WM_STRUT(_PARTIAL). This avoids needing DRM master while still producing a
 real "bottom half goes black" visual effect.
 
-Wayland integration is intentionally left for later (compositor-specific).
+Wayland support is implemented for wlroots-based compositors via a layer-shell
+helper (x1fold_wl_blank). Other Wayland compositors may not implement the
+required protocol; in that case we log and keep retrying.
 """
 
 from __future__ import annotations
@@ -56,6 +58,14 @@ def _xrandr(display: str, argv: list[str]) -> subprocess.CompletedProcess[str]:
     env["DISPLAY"] = display
     return subprocess.run(["xrandr", *argv], check=False, capture_output=True, text=True, env=env)
 
+
+def _is_wayland_session() -> bool:
+    st = (os.environ.get("XDG_SESSION_TYPE") or "").strip().lower()
+    if st:
+        return st == "wayland"
+    return bool(os.environ.get("WAYLAND_DISPLAY"))
+
+
 def _x11_output_rotation(display: str, output: str) -> str | None:
     proc = _xrandr(display, ["--query"])
     if proc.returncode != 0:
@@ -65,11 +75,17 @@ def _x11_output_rotation(display: str, output: str) -> str | None:
             continue
         if " connected" not in line:
             continue
-        # Example: "(normal left inverted right x axis y axis)"
-        m = re.search(r"\((normal|left|right|inverted)\b", line)
+        # `xrandr --query` prints the *current* rotation as an optional token
+        # after the mode geometry (and before the "(normal left ...)" list),
+        # e.g.:
+        #   eDP-1 connected 2560x2024+0+0 left (normal left inverted right x axis y axis) ...
+        m = re.search(
+            r"\bconnected\b.*?\d+x\d+\+\d+\+\d+(?:\s+(normal|left|right|inverted))?\s+\(",
+            line,
+        )
         if not m:
             return None
-        return m.group(1)
+        return m.group(1) or "normal"
     return None
 
 
@@ -346,6 +362,60 @@ class X11Blanker:
         self.key = None
 
 
+class WaylandBlanker:
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen[str] | None = None
+        self.key: tuple[str, int, str] | None = None  # (helper, active_size, side)
+
+    def ensure(self, *, helper: str, active_size: int, side: str, name: str) -> tuple[bool, str]:
+        key = (str(helper), int(active_size), str(side))
+        if self.proc and self.proc.poll() is None and self.key == key:
+            return True, ""
+        self.stop()
+        self.key = key
+        try:
+            self.proc = subprocess.Popen(
+                [
+                    helper,
+                    "--side",
+                    str(side),
+                    "--active-size",
+                    str(int(active_size)),
+                    "--name",
+                    str(name),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+        # Give it a moment to fail fast if WAYLAND_DISPLAY/auth is wrong.
+        time.sleep(0.2)
+        if self.proc.poll() is None:
+            return True, ""
+        err = (self.proc.stderr.read() if self.proc.stderr else "").strip()
+        return False, err or f"wayland blank helper exited rc={self.proc.returncode}"
+
+    def stop(self) -> None:
+        if not self.proc:
+            return
+        if self.proc.poll() is not None:
+            self.proc = None
+            self.key = None
+            return
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=2.0)
+        self.proc = None
+        self.key = None
+
+
 def _read_state(path: Path) -> dict[str, Any] | None:
     try:
         return json.loads(path.read_text(encoding="utf-8", errors="replace"))
@@ -406,6 +476,20 @@ def _apply_x11(
     return True, ""
 
 
+def _apply_wayland(
+    desired: str,
+    *,
+    blanker: WaylandBlanker,
+    helper: str,
+    active_size: int,
+    name: str,
+) -> tuple[bool, str]:
+    if desired == "half":
+        return blanker.ensure(helper=helper, active_size=active_size, side="bottom", name=name)
+    blanker.stop()
+    return True, ""
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description="Apply X1 Fold halfblank UI geometry from state.json (user session).")
     p.add_argument(
@@ -426,6 +510,12 @@ def main(argv: list[str]) -> int:
         type=float,
         default=0.5,
         help="Polling interval for iio-sensor-proxy orientation (default: 0.5).",
+    )
+    p.add_argument(
+        "--x11-auto-rotate-min-apply-s",
+        type=float,
+        default=1.0,
+        help="Minimum time between applying XRandR rotations from sensors (default: 1.0).",
     )
     p.add_argument(
         "--x11-force-normal-when-half",
@@ -464,6 +554,17 @@ def main(argv: list[str]) -> int:
     )
     p.add_argument("--x11-blank-name", default="X1FOLD_HALFBLANK", help="X11 blank window name (default: X1FOLD_HALFBLANK).")
     p.add_argument("--no-x11-setmonitor", action="store_true", help="Disable xrandr --setmonitor/--delmonitor calls.")
+    p.add_argument(
+        "--wayland-blank-helper",
+        default="x1fold_wl_blank",
+        help="Helper to create Wayland layer-shell blank region (default: x1fold_wl_blank in $PATH).",
+    )
+    p.add_argument(
+        "--wayland-blank-name",
+        default="X1FOLD_HALFBLANK",
+        help="Namespace/name passed to the Wayland blank helper (default: X1FOLD_HALFBLANK).",
+    )
+    p.add_argument("--no-wayland", action="store_true", help="Force X11 behavior even if XDG_SESSION_TYPE=wayland.")
     p.add_argument("--once", action="store_true", help="Apply once and exit (useful with systemd .path units).")
     args = p.parse_args(argv)
 
@@ -475,10 +576,12 @@ def main(argv: list[str]) -> int:
         x11_auto_rotate=bool(args.x11_auto_rotate),
     )
 
-    last_key: tuple[str | None, float | None, str | None] = (None, None, None)  # (desired, mtime, rotation_applied)
-    blanker = X11Blanker()
+    last_key: tuple[str | None, float | None, str | None, str | None] = (None, None, None, None)  # (desired, mtime, backend, rotation)
+    x11_blanker = X11Blanker()
+    wl_blanker = WaylandBlanker()
     last_sensor_check = 0.0
     last_sensor_orientation: str | None = None
+    last_x11_rotate_apply = 0.0
     if args.x11_auto_rotate:
         _sensorproxy_claim()
 
@@ -496,7 +599,8 @@ def main(argv: list[str]) -> int:
         except OSError:
             mtime = None
 
-        blanker_running = bool(blanker.proc and blanker.proc.poll() is None)
+        x11_blanker_running = bool(x11_blanker.proc and x11_blanker.proc.poll() is None)
+        wl_blanker_running = bool(wl_blanker.proc and wl_blanker.proc.poll() is None)
 
         if desired not in {"half", "full"}:
             _log("no_desired_mode", desired=desired)
@@ -505,9 +609,53 @@ def main(argv: list[str]) -> int:
             time.sleep(args.interval_s)
             continue
 
+        use_wayland = _is_wayland_session() and not bool(args.no_wayland)
+        if use_wayland:
+            if x11_blanker_running:
+                x11_blanker.stop()
+                x11_blanker_running = False
+
+            key = (desired, mtime, "wayland", None)
+            same_key = key == last_key
+            if same_key and desired == "half" and not wl_blanker_running:
+                same_key = False
+            if same_key and desired == "full" and wl_blanker_running:
+                same_key = False
+            if same_key:
+                if args.once:
+                    return 0
+                time.sleep(args.interval_s)
+                continue
+            last_key = key
+
+            ok, err = _apply_wayland(
+                desired,
+                blanker=wl_blanker,
+                helper=str(args.wayland_blank_helper),
+                active_size=int(args.active_size),
+                name=str(args.wayland_blank_name),
+            )
+            if ok:
+                _log("applied", desired=desired, backend="wayland", docked=docked, blank_helper=str(args.wayland_blank_helper))
+                if args.once:
+                    return 0
+                time.sleep(args.interval_s)
+                continue
+
+            _log("apply_failed", desired=desired, backend="wayland", docked=docked, error=err)
+            if args.once:
+                return 1
+            time.sleep(args.interval_s)
+            continue
+
+        # X11 path.
+        if wl_blanker_running:
+            wl_blanker.stop()
+            wl_blanker_running = False
+
         x11_display = _detect_x11_display()
         if not x11_display:
-            _log("no_x11_display", desired=desired)
+            _log("no_x11_display", desired=desired, backend="x11")
             if args.once:
                 return 0
             time.sleep(args.interval_s)
@@ -521,11 +669,18 @@ def main(argv: list[str]) -> int:
             time.sleep(args.interval_s)
             continue
 
-        rotation = _x11_output_rotation(x11_display, output) or (last_key[2] or "normal")
+        rotation = _x11_output_rotation(x11_display, output)
+        if rotation is None:
+            # If we can't query current rotation (e.g. transient XRandR failure),
+            # still allow forced rotations (like "force normal when docked") to
+            # proceed rather than silently assuming "normal".
+            rotation = "unknown"
         now = time.monotonic()
         target_rot: str | None = None
+        target_rot_reason: str | None = None
         if desired == "half" and args.x11_force_normal_when_half:
             target_rot = "normal"
+            target_rot_reason = "force_normal_when_half"
         elif args.x11_auto_rotate and desired == "full" and (docked in (0, None)):
             if (now - last_sensor_check) >= float(args.x11_auto_rotate_interval_s):
                 last_sensor_check = now
@@ -533,25 +688,13 @@ def main(argv: list[str]) -> int:
                 if ori:
                     last_sensor_orientation = ori
                 target_rot = _sensorproxy_to_xrandr_rotation(ori) if ori else None
+                target_rot_reason = "sensor"
         rotated = False
         if target_rot and target_rot != rotation:
-            ok, err = _x11_set_rotation(x11_display, output, target_rot)
-            if ok:
+            min_apply_s = float(args.x11_auto_rotate_min_apply_s or 0.0)
+            if target_rot_reason == "sensor" and min_apply_s > 0 and (now - last_x11_rotate_apply) < min_apply_s:
                 _log(
-                    "x11_rotated",
-                    display=x11_display,
-                    output=output,
-                    from_rotation=rotation,
-                    rotation=target_rot,
-                    sensor_orientation=last_sensor_orientation,
-                    docked=docked,
-                    desired=desired,
-                )
-                rotation = target_rot
-                rotated = True
-            else:
-                _log(
-                    "x11_rotate_failed",
+                    "x11_rotate_rate_limited",
                     display=x11_display,
                     output=output,
                     from_rotation=rotation,
@@ -559,8 +702,43 @@ def main(argv: list[str]) -> int:
                     sensor_orientation=last_sensor_orientation,
                     docked=docked,
                     desired=desired,
-                    error=err,
+                    since_last_apply_s=round(now - last_x11_rotate_apply, 3),
+                    min_apply_s=min_apply_s,
                 )
+            else:
+                rot_start = time.monotonic()
+                ok, err = _x11_set_rotation(x11_display, output, target_rot)
+                rot_elapsed_s = round(time.monotonic() - rot_start, 3)
+                if ok:
+                    _log(
+                        "x11_rotated",
+                        display=x11_display,
+                        output=output,
+                        from_rotation=rotation,
+                        rotation=target_rot,
+                        sensor_orientation=last_sensor_orientation,
+                        docked=docked,
+                        desired=desired,
+                        elapsed_s=rot_elapsed_s,
+                        reason=target_rot_reason,
+                    )
+                    rotation = target_rot
+                    rotated = True
+                    last_x11_rotate_apply = time.monotonic()
+                else:
+                    _log(
+                        "x11_rotate_failed",
+                        display=x11_display,
+                        output=output,
+                        from_rotation=rotation,
+                        desired_rotation=target_rot,
+                        sensor_orientation=last_sensor_orientation,
+                        docked=docked,
+                        desired=desired,
+                        error=err,
+                        elapsed_s=rot_elapsed_s,
+                        reason=target_rot_reason,
+                    )
 
         # After rotation, map the touchscreen/pen devices to the output so the
         # digitizer coordinates track the new orientation.
@@ -575,6 +753,10 @@ def main(argv: list[str]) -> int:
             mapped = 0
             for dev_id, dev_name in devices:
                 if rx and not rx.search(dev_name):
+                    continue
+                # xinput map-to-output frequently fails on tablet "Pen" nodes
+                # (BadMatch). Skip them by default; touch nodes still get mapped.
+                if " Pen" in dev_name or dev_name.endswith("Pen"):
                     continue
                 matched += 1
                 ok, err = _xinput_map_to_output(x11_display, dev_id, output)
@@ -592,7 +774,8 @@ def main(argv: list[str]) -> int:
                     regex=str(args.x11_xinput_regex),
                 )
 
-        key = (desired, mtime, rotation)
+        blanker_running = x11_blanker_running
+        key = (desired, mtime, "x11", rotation)
         same_key = key == last_key
         if same_key and desired == "half" and not blanker_running:
             same_key = False
@@ -607,7 +790,7 @@ def main(argv: list[str]) -> int:
 
         ok, err = _apply_x11(
             desired,
-            blanker=blanker,
+            blanker=x11_blanker,
             display=x11_display,
             output=output,
             helper=str(args.x11_blank_helper),
@@ -620,6 +803,7 @@ def main(argv: list[str]) -> int:
             _log(
                 "applied",
                 desired=desired,
+                backend="x11",
                 display=x11_display,
                 output=output,
                 rotation=rotation,
@@ -631,6 +815,7 @@ def main(argv: list[str]) -> int:
             _log(
                 "apply_failed",
                 desired=desired,
+                backend="x11",
                 display=x11_display,
                 output=output,
                 rotation=rotation,

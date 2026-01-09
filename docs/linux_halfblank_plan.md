@@ -47,7 +47,8 @@ Implementation options (pick the first that works on b0xx):
    - note: `x1fold_x11_blank` also clamps (warps) the cursor back into the active region if anything places it into the blank area, to avoid “cursor stuck in the blank part” UX.
    This doesn’t require DRM master (Xorg remains DRM master), yet produces a real “bottom half goes black” visual effect and a WM-usable work area that matches Windows semantics.
    - orientation: when the detachable display is rotated “on its side”, rotate the output (and remap touchscreen coordinates) based on iio-sensor-proxy. This is separate from halfblank and should generally be active when undocked/full.
-4. **Wayland compositor integration:** when running Wayland, call the compositor’s output tool (e.g., `wlr-randr`) or compositor-specific APIs to constrain the “logical output” region to the top-half. This is less universal but gives the cleanest “Windows-like” window reflow.
+     - note (2026‑01‑09): if rotation feels “sluggish” with several seconds of black screen, check `journalctl _SYSTEMD_USER_UNIT=x1fold-halfblank-ui.service` for repeated `x11_rotated` events (e.g., “from_rotation=normal → rotation=left” looping). That symptom was caused by a bug parsing `xrandr --query` (reading the capability list `(normal left …)` instead of the current rotation token); ensure `/usr/local/bin/x1fold_halfblank_ui.py` matches the repo version.
+4. **Wayland (wlroots) integration (implemented):** create a layer-shell surface over the blank region and set `exclusive_zone` so normal windows avoid it (`x1fold_wl_blank`, requires compositor support for `zwlr_layer_shell_v1`).
 
 ## Deliverables (sustainable + installable)
 1. `x1fold/tools/x1fold_mode.py`

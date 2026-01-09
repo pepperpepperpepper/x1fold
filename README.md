@@ -5,7 +5,7 @@ This repository implements the Lenovo X1 Fold “halfblank” behavior on Linux:
 The implementation is split into:
 
 - **A system policy daemon** (`x1fold_halfblankd.py`) that decides whether we should be in `half` or `full` mode (based on dock state), applies the digitizer toggle, and writes a small state file.
-- **A per-user session UI helper** (`x1fold_halfblank_ui.py`) that reads the state file and applies the *display geometry* part inside the logged-in desktop session.
+- **A per-user session UI helper** (`x1fold_halfblank_ui.py`) that reads the state file and applies the *display geometry* part inside the logged-in desktop session (and can optionally do X11 auto-rotation + touchscreen remapping).
 
 This mirrors how the platform behaves under Windows: the “halfblank” effect is a combination of (1) a digitizer-side mode latch and (2) an OS-visible display/policy change.
 
@@ -15,6 +15,7 @@ This mirrors how the platform behaves under Windows: the “halfblank” effect 
 - Toggles the Wacom digitizer “half/full” latch (HID-over-I²C device, `056a:52ba`) using the most reliable available backend.
 - Applies a “top-only usable area” policy:
   - **X11:** creates a black DOCK/STRUT window over the bottom region, sets `_NET_WM_STRUT_PARTIAL` so WMs reserve that space, and constrains the cursor from entering the blank region.
+  - **Wayland (wlroots):** creates a layer-shell surface over the blank region and sets `exclusive_zone` so normal windows avoid that space (requires compositor support for `zwlr_layer_shell_v1`).
   - **TTY/DRM (optional):** can clip the primary plane using an atomic commit (requires DRM master).
   - **Orientation (optional):** under X11, can auto-rotate based on iio-sensor-proxy and remap touchscreen coordinates via `xinput map-to-output` (useful when the detachable display is rotated).
 

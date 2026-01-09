@@ -57,6 +57,22 @@ if [[ -f "$x1fold_root/tools/x1fold_x11_blank.c" ]]; then
   fi
 fi
 
+if [[ -f "$x1fold_root/tools/x1fold_wl_blank.c" ]]; then
+  if command -v cc >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1 && pkg-config --exists wayland-client; then
+    tmp_bin="$(mktemp -t x1fold_wl_blank.XXXXXX)"
+    cc -O2 -Wall -Wextra \
+      "$x1fold_root/tools/x1fold_wl_blank.c" \
+      "$x1fold_root/tools/wayland/wlr-layer-shell-unstable-v1-protocol.c" \
+      "$x1fold_root/tools/wayland/xdg-shell-protocol.c" \
+      -o "$tmp_bin" \
+      $(pkg-config --cflags --libs wayland-client)
+    install -Dm0755 "$tmp_bin" /usr/local/bin/x1fold_wl_blank
+    rm -f "$tmp_bin"
+  else
+    echo "warning: tools/x1fold_wl_blank.c present but missing build deps (need cc + pkg-config wayland-client); skipping x1fold_wl_blank install" >&2
+  fi
+fi
+
 install -Dm0755 "$x1fold_root/scripts/halfblank_switch.sh" /usr/local/bin/halfblank_switch.sh
 install -Dm0755 "$x1fold_root/scripts/halfblank_regression.sh" /usr/local/bin/halfblank_regression.sh
 install -Dm0755 "$x1fold_root/scripts/halfblank_collect.sh" /usr/local/bin/halfblank_collect.sh
