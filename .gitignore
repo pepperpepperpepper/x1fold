@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.o
+*.so
+*.a
+*.out
+*.log
+*.swp
+
+# Local build products
+drm_clip
+x1fold_x11_blank
