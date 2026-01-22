@@ -221,6 +221,24 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--interval-s", type=float, default=0.2, help="Polling interval (seconds).")
     parser.add_argument(
+        "--dock-debounce-on-s",
+        type=float,
+        default=0.0,
+        help="Require docked=1 to be stable for this many seconds before switching into half mode (0 disables; default: 0).",
+    )
+    parser.add_argument(
+        "--dock-debounce-off-s",
+        type=float,
+        default=0.0,
+        help="Require docked=0 to be stable for this many seconds before switching into full mode (0 disables; default: 0).",
+    )
+    parser.add_argument(
+        "--dock-debounce-interval-s",
+        type=float,
+        default=0.2,
+        help="Polling interval while confirming a dock state transition (seconds; default: 0.2).",
+    )
+    parser.add_argument(
         "--cmd-timeout-s",
         type=float,
         default=8.0,
@@ -261,6 +279,28 @@ def main(argv: list[str]) -> int:
         default="",
         help="Path to drm_clip helper to pass to x1fold_mode.py (default: unset).",
     )
+    parser.add_argument(
+        "--tty-clip",
+        action="store_true",
+        help="Best-effort: when on a Linux text console, also apply drm_clip + tty resize via x1fold_tty.py.",
+    )
+    parser.add_argument(
+        "--tty-state-file",
+        type=Path,
+        default=Path("/run/x1fold-halfblank/tty_state.json"),
+        help="State file for x1fold_tty.py (default: /run/x1fold-halfblank/tty_state.json).",
+    )
+    parser.add_argument(
+        "--tty-tool",
+        default="",
+        help="Path to x1fold_tty.py helper (default: auto-detect from common install locations).",
+    )
+    parser.add_argument(
+        "--tty-enforce-every-s",
+        type=float,
+        default=0.0,
+        help="While dock state is stable, periodically re-apply tty clip/resize (0 disables; default: 0).",
+    )
     parser.add_argument("--half-cmd", default="", help="Command to run when docked (string; default uses halfblank_switch).")
     parser.add_argument("--full-cmd", default="", help="Command to run when undocked (string; default uses halfblank_switch).")
     parser.add_argument(
@@ -294,6 +334,35 @@ def main(argv: list[str]) -> int:
             cmd += ["--drm-clip", str(args.drm_clip)]
         return cmd
 
+    def _detect_tty_tool() -> str:
+        if args.tty_tool:
+            return str(args.tty_tool)
+        for candidate in (
+            Path("/usr/local/bin/x1fold_tty.py"),
+            Path("/usr/bin/x1fold_tty.py"),
+            Path("/usr/bin/x1fold_tty"),
+        ):
+            if candidate.exists():
+                return str(candidate)
+        repo_root = Path(__file__).resolve().parents[1]
+        local = repo_root / "tools" / "x1fold_tty.py"
+        if local.exists():
+            return str(local)
+        return "x1fold_tty.py"
+
+    tty_tool = _detect_tty_tool()
+
+    def _tty_cmd(mode: str, *, clear: bool) -> list[str]:
+        cmd = [tty_tool]
+        if args.drm_clip:
+            cmd += ["--drm-clip", str(args.drm_clip)]
+        if args.tty_state_file:
+            cmd += ["--state-file", str(args.tty_state_file)]
+        cmd += ["set", mode, "--height", str(int(args.display_height)), "--best-effort"]
+        if not clear:
+            cmd += ["--no-clear"]
+        return cmd
+
     def _default_status_cmd() -> list[str]:
         for candidate in (
             Path("/usr/local/bin/x1fold_mode.py"),
@@ -311,9 +380,17 @@ def main(argv: list[str]) -> int:
     )
 
     last: DockState | None = None
+    pending: DockState | None = None
+    pending_since = 0.0
     last_apply_ts = 0.0
     last_enforce_ts = 0.0
     enforce_every_s = float(args.enforce_every_s or 0.0)
+    last_tty_enforce_ts = 0.0
+    tty_enforce_every_s = float(args.tty_enforce_every_s or 0.0)
+
+    # Track the active VT so we can (re)apply tty halfblank when switching
+    # between a graphical VT (KD_GRAPHICS; sway) and a text VT (KD_TEXT).
+    last_active_tty = None
 
     _log(
         "start",
@@ -321,6 +398,8 @@ def main(argv: list[str]) -> int:
         interval_s=args.interval_s,
         apply_initial=bool(args.apply_initial),
         enforce_every_s=enforce_every_s,
+        tty_clip=bool(args.tty_clip),
+        tty_enforce_every_s=tty_enforce_every_s,
         dry_run=bool(args.dry_run),
         cmds={"half": cmds.half, "full": cmds.full, "status": cmds.status},
         state_file=str(args.state_file),
@@ -339,6 +418,8 @@ def main(argv: list[str]) -> int:
         )
         if state.docked not in (0, 1):
             # We can't act without a stable signal; keep polling.
+            pending = None
+            pending_since = 0.0
             time.sleep(args.interval_s)
             continue
 
@@ -359,6 +440,13 @@ def main(argv: list[str]) -> int:
                     },
                 )
                 rc = run_cmd(cmds.half if state.docked else cmds.full, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
+                rc_tty = None
+                if args.tty_clip:
+                    rc_tty = run_cmd(
+                        _tty_cmd(desired, clear=(desired == "half")),
+                        dry_run=args.dry_run,
+                        timeout_s=args.cmd_timeout_s,
+                    )
                 _log("apply_initial", docked=state.docked, modeid=state.modeid, desired=desired, rc=rc)
                 _write_json_atomic(
                     args.state_file,
@@ -369,6 +457,7 @@ def main(argv: list[str]) -> int:
                         "dock": state.__dict__,
                         "desired": desired,
                         "apply_rc": rc,
+                        "tty_rc": rc_tty,
                     },
                 )
                 last_apply_ts = time.monotonic()
@@ -377,6 +466,31 @@ def main(argv: list[str]) -> int:
 
         now = time.monotonic()
         if state.docked == last.docked:
+            pending = None
+            pending_since = 0.0
+            if args.tty_clip:
+                active_tty = _safe_read_text(Path("/sys/class/tty/tty0/active"))
+                if active_tty and active_tty != last_active_tty:
+                    last_active_tty = active_tty
+                    desired = "half" if state.docked else "full"
+                    rc_tty = run_cmd(_tty_cmd(desired, clear=False), dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
+                    if rc_tty != 0:
+                        _log(
+                            "tty_active_change_error",
+                            docked=state.docked,
+                            modeid=state.modeid,
+                            desired=desired,
+                            active_tty=active_tty,
+                            rc=rc_tty,
+                        )
+
+            if args.tty_clip and tty_enforce_every_s > 0 and (now - last_tty_enforce_ts) >= tty_enforce_every_s:
+                last_tty_enforce_ts = now
+                desired = "half" if state.docked else "full"
+                rc_tty = run_cmd(_tty_cmd(desired, clear=False), dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
+                if rc_tty != 0:
+                    _log("tty_enforce_error", docked=state.docked, modeid=state.modeid, desired=desired, rc=rc_tty)
+
             if enforce_every_s > 0 and (now - last_enforce_ts) >= enforce_every_s:
                 last_enforce_ts = now
                 desired = "half" if state.docked else "full"
@@ -401,6 +515,13 @@ def main(argv: list[str]) -> int:
                         dry_run=args.dry_run,
                         timeout_s=args.cmd_timeout_s,
                     )
+                    rc_tty = None
+                    if args.tty_clip:
+                        rc_tty = run_cmd(
+                            _tty_cmd(desired, clear=False),
+                            dry_run=args.dry_run,
+                            timeout_s=args.cmd_timeout_s,
+                        )
                     _log(
                         "enforce_apply",
                         docked=state.docked,
@@ -408,6 +529,7 @@ def main(argv: list[str]) -> int:
                         desired=desired,
                         observed=current,
                         rc=rc,
+                        tty_rc=rc_tty,
                         since_last_apply_s=round(now - last_apply_ts, 3),
                     )
                     _write_json_atomic(
@@ -420,12 +542,53 @@ def main(argv: list[str]) -> int:
                             "desired": desired,
                             "observed": current,
                             "apply_rc": rc,
+                            "tty_rc": rc_tty,
                             "status": status,
                         },
                     )
                     last_apply_ts = now
             time.sleep(args.interval_s)
             continue
+
+        # Dock signal changed. Optionally debounce transitions to avoid flapping
+        # when magnets hover or the EC signal is noisy.
+        debounce_s = float(args.dock_debounce_on_s if int(state.docked) == 1 else args.dock_debounce_off_s)
+        debounce_poll_s = float(args.dock_debounce_interval_s or 0.0)
+        if debounce_s > 0:
+            if pending is None or pending.docked != state.docked:
+                pending = state
+                pending_since = now
+                desired = "half" if state.docked else "full"
+                _log(
+                    "dock_change_candidate",
+                    from_docked=last.docked,
+                    to_docked=state.docked,
+                    desired=desired,
+                    debounce_s=debounce_s,
+                )
+                _write_json_atomic(
+                    args.state_file,
+                    {
+                        "ts": utc_iso(),
+                        "event": "dock_change_candidate",
+                        "dmi": dmi,
+                        "dock": state.__dict__,
+                        "from_docked": last.docked,
+                        "to_docked": state.docked,
+                        "desired": desired,
+                        "debounce_s": debounce_s,
+                    },
+                )
+                sleep_s = debounce_poll_s if debounce_poll_s > 0 else args.interval_s
+                time.sleep(max(0.05, float(sleep_s)))
+                continue
+            if (now - pending_since) < debounce_s:
+                sleep_s = debounce_poll_s if debounce_poll_s > 0 else args.interval_s
+                time.sleep(max(0.05, float(sleep_s)))
+                continue
+            # Stable long enough; accept the transition.
+            pending = None
+            pending_since = 0.0
 
         desired = "half" if state.docked else "full"
         # Write desired state immediately so UI helpers can react even if the
@@ -443,6 +606,9 @@ def main(argv: list[str]) -> int:
             },
         )
         rc = run_cmd(cmds.half if state.docked else cmds.full, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
+        rc_tty = None
+        if args.tty_clip:
+            rc_tty = run_cmd(_tty_cmd(desired, clear=(desired == "half")), dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
         _log(
             "dock_change",
             from_docked=last.docked,
@@ -450,6 +616,7 @@ def main(argv: list[str]) -> int:
             modeid=state.modeid,
             desired=desired,
             rc=rc,
+            tty_rc=rc_tty,
         )
         _write_json_atomic(
             args.state_file,
@@ -462,6 +629,7 @@ def main(argv: list[str]) -> int:
                 "to_docked": state.docked,
                 "desired": desired,
                 "apply_rc": rc,
+                "tty_rc": rc_tty,
             },
         )
         last_apply_ts = now

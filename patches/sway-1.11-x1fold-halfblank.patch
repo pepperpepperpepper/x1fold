@@ -1,0 +1,159 @@
+diff --git a/include/sway/commands.h b/include/sway/commands.h
+index 5210d3ba..01e5e1c7 100644
+--- a/include/sway/commands.h
++++ b/include/sway/commands.h
+@@ -302,6 +302,7 @@ sway_cmd output_cmd_subpixel;
+ sway_cmd output_cmd_toggle;
+ sway_cmd output_cmd_transform;
+ sway_cmd output_cmd_unplug;
++sway_cmd output_cmd_x1fold_halfblank;
+ 
+ sway_cmd seat_cmd_attach;
+ sway_cmd seat_cmd_cursor;
+diff --git a/include/sway/config.h b/include/sway/config.h
+index bb770c6f..0f096b66 100644
+--- a/include/sway/config.h
++++ b/include/sway/config.h
+@@ -284,6 +284,7 @@ struct output_config {
+ 	float scale;
+ 	enum scale_filter_mode scale_filter;
+ 	int32_t transform;
++	int x1fold_active_height; // -1 unset, 0 disable, >0 active height (px)
+ 	enum wl_output_subpixel subpixel;
+ 	int max_render_time; // In milliseconds
+ 	int adaptive_sync;
+diff --git a/sway/commands/output.c b/sway/commands/output.c
+index 9d58413f..58bc00d9 100644
+--- a/sway/commands/output.c
++++ b/sway/commands/output.c
+@@ -30,6 +30,7 @@ static const struct cmd_handler output_handlers[] = {
+ 	{ "toggle", output_cmd_toggle },
+ 	{ "transform", output_cmd_transform },
+ 	{ "unplug", output_cmd_unplug },
++	{ "x1fold_halfblank", output_cmd_x1fold_halfblank },
+ };
+ 
+ struct cmd_results *cmd_output(int argc, char **argv) {
+diff --git a/sway/commands/output/x1fold_halfblank.c b/sway/commands/output/x1fold_halfblank.c
+new file mode 100644
+index 00000000..d5f1472b
+--- /dev/null
++++ b/sway/commands/output/x1fold_halfblank.c
+@@ -0,0 +1,60 @@
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <strings.h>
++#include <string.h>
++#include "sway/commands.h"
++#include "sway/config.h"
++#include "sway/output.h"
++
++static bool is_internal_panel(const char *name) {
++	return name && strncmp(name, "eDP", 3) == 0;
++}
++
++struct cmd_results *output_cmd_x1fold_halfblank(int argc, char **argv) {
++	if (!config->handler_context.output_config) {
++		return cmd_results_new(CMD_FAILURE, "Missing output config");
++	}
++	if (!argc) {
++		return cmd_results_new(CMD_INVALID, "Missing x1fold_halfblank argument.");
++	}
++
++	struct output_config *oc = config->handler_context.output_config;
++	if (strcmp(oc->name, "*") == 0) {
++		return cmd_results_new(CMD_INVALID,
++			"x1fold_halfblank cannot be applied to all outputs");
++	}
++
++	// Battery-first safety: only allow on the internal panel.
++	if (!config->reading) {
++		struct sway_output *output = output_by_name_or_id(oc->name);
++		if (output && !is_internal_panel(output->wlr_output->name)) {
++			return cmd_results_new(CMD_INVALID,
++				"x1fold_halfblank is only supported for the internal panel");
++		}
++	}
++
++	int consumed = 0;
++	if (strcasecmp(argv[0], "disable") == 0 || strcasecmp(argv[0], "off") == 0) {
++		oc->x1fold_active_height = 0;
++		consumed = 1;
++	} else if (strcasecmp(argv[0], "enable") == 0 || strcasecmp(argv[0], "on") == 0) {
++		if (argc < 2) {
++			return cmd_results_new(CMD_INVALID, "Missing active height argument.");
++		}
++		char *end = NULL;
++		long h = strtol(argv[1], &end, 10);
++		if (end == argv[1] || (end && *end) || h <= 0 || h > INT32_MAX) {
++			return cmd_results_new(CMD_INVALID, "Invalid active height.");
++		}
++		oc->x1fold_active_height = (int)h;
++		consumed = 2;
++	} else {
++		return cmd_results_new(CMD_INVALID,
++			"Invalid x1fold_halfblank argument (expected enable <px> or disable).");
++	}
++
++	config->handler_context.leftovers.argc = argc - consumed;
++	config->handler_context.leftovers.argv = argv + consumed;
++	return NULL;
++}
+diff --git a/sway/config/output.c b/sway/config/output.c
+index df80cab6..eb151182 100644
+--- a/sway/config/output.c
++++ b/sway/config/output.c
+@@ -71,6 +71,7 @@ struct output_config *new_output_config(const char *name) {
+ 	oc->scale = -1;
+ 	oc->scale_filter = SCALE_FILTER_DEFAULT;
+ 	oc->transform = -1;
++	oc->x1fold_active_height = -1;
+ 	oc->subpixel = WL_OUTPUT_SUBPIXEL_UNKNOWN;
+ 	oc->max_render_time = -1;
+ 	oc->adaptive_sync = -1;
+@@ -120,6 +121,9 @@ static void supersede_output_config(struct output_config *dst, struct output_con
+ 	if (src->transform != -1) {
+ 		dst->transform = -1;
+ 	}
++	if (src->x1fold_active_height != -1) {
++		dst->x1fold_active_height = -1;
++	}
+ 	if (src->max_render_time != -1) {
+ 		dst->max_render_time = -1;
+ 	}
+@@ -194,6 +198,9 @@ static void merge_output_config(struct output_config *dst, struct output_config
+ 	if (src->transform != -1) {
+ 		dst->transform = src->transform;
+ 	}
++	if (src->x1fold_active_height != -1) {
++		dst->x1fold_active_height = src->x1fold_active_height;
++	}
+ 	if (src->max_render_time != -1) {
+ 		dst->max_render_time = src->max_render_time;
+ 	}
+@@ -500,6 +507,12 @@ static void queue_output_config(struct output_config *oc,
+ 	} else {
+ 		wlr_output_state_set_render_format(pending, DRM_FORMAT_XRGB8888);
+ 	}
++
++	if (oc && oc->x1fold_active_height != -1 &&
++			strncmp(wlr_output->name, "eDP", 3) == 0) {
++		wlr_output_state_set_x1fold_active_height(pending,
++			oc->x1fold_active_height);
++	}
+ }
+ 
+ static bool finalize_output_config(struct output_config *oc, struct sway_output *output) {
+diff --git a/sway/meson.build b/sway/meson.build
+index 8042c89b..1f604b36 100644
+--- a/sway/meson.build
++++ b/sway/meson.build
+@@ -207,6 +207,7 @@ sway_sources = files(
+ 	'commands/output/transform.c',
+ 	'commands/output/unplug.c',
+ 	'commands/output/color_profile.c',
++	'commands/output/x1fold_halfblank.c',
+ 
+ 	'tree/arrange.c',
+ 	'tree/container.c',

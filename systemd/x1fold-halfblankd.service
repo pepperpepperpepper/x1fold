@@ -1,13 +1,13 @@
 [Unit]
 # Source: x1fold/systemd/x1fold-halfblankd.service
 Description=Lenovo X1 Fold halfblank policy daemon (dock-triggered)
-After=multi-user.target
-Wants=multi-user.target
+After=multi-user.target systemd-modules-load.service sys-kernel-debug.mount
+Wants=multi-user.target sys-kernel-debug.mount
 
 [Service]
 Type=simple
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/usr/local/bin/x1fold_halfblankd.py --require-x1fold --apply-initial --display none --digitizer auto --enforce-every-s 0 --state-file /run/x1fold-halfblank/state.json
+ExecStart=/usr/local/bin/x1fold_halfblankd.py --require-x1fold --apply-initial --backend ec_sys --interval-s 1.5 --dock-debounce-on-s 0.4 --dock-debounce-off-s 1.0 --dock-debounce-interval-s 0.2 --display none --digitizer auto --enforce-every-s 0 --tty-clip --tty-enforce-every-s 0 --drm-clip /usr/local/bin/drm_clip --state-file /run/x1fold-halfblank/state.json
 Restart=on-failure
 RestartSec=1
 

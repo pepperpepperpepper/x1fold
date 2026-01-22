@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -34,6 +35,68 @@ static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int signo) {
   (void)signo;
   g_stop = 1;
+}
+
+static void install_signal_handlers(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = on_signal;
+  sigemptyset(&sa.sa_mask);
+  // Do not use SA_RESTART: we want blocking Wayland calls to return so the
+  // main loop can observe g_stop and exit promptly.
+  sa.sa_flags = 0;
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+}
+
+static int pump_events(struct wl_display *display, int timeout_ms) {
+  if (wl_display_dispatch_pending(display) < 0) {
+    return -1;
+  }
+  if (wl_display_flush(display) < 0) {
+    return -1;
+  }
+
+  // Prepare a non-blocking read, poll, then read+dispatch pending events.
+  //
+  // We intentionally avoid wl_display_dispatch() here: it can block inside
+  // libwayland even when we already polled, and it doesn't reliably exit on
+  // SIGTERM when Sway is on an inactive VT.
+  while (wl_display_prepare_read(display) != 0) {
+    if (wl_display_dispatch_pending(display) < 0) {
+      return -1;
+    }
+    if (wl_display_flush(display) < 0) {
+      return -1;
+    }
+  }
+
+  const int fd = wl_display_get_fd(display);
+  struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+  int rc = poll(&pfd, 1, timeout_ms);
+  if (rc < 0) {
+    wl_display_cancel_read(display);
+    if (errno == EINTR) {
+      return 0;
+    }
+    return -1;
+  }
+  if (rc == 0) {
+    wl_display_cancel_read(display);
+    return 0;
+  }
+  if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+    wl_display_cancel_read(display);
+    return -1;
+  }
+
+  if (wl_display_read_events(display) < 0) {
+    return -1;
+  }
+  if (wl_display_dispatch_pending(display) < 0) {
+    return -1;
+  }
+  return 0;
 }
 
 static void dief(const char *fmt, ...) {
@@ -373,7 +436,7 @@ static void create_surface(struct app *app) {
 
   const char *ns = app->name ? app->name : "x1fold-halfblank";
   app->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
-      app->layer_shell, app->surface, app->out.wl_output, ZWLR_LAYER_SHELL_V1_LAYER_TOP, ns);
+      app->layer_shell, app->surface, app->out.wl_output, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, ns);
   if (!app->layer_surface) {
     dief("zwlr_layer_shell_v1_get_layer_surface failed");
   }
@@ -431,8 +494,7 @@ int main(int argc, char **argv) {
     dief("--active-size must be >= 1");
   }
 
-  signal(SIGINT, on_signal);
-  signal(SIGTERM, on_signal);
+  install_signal_handlers();
 
   struct app app = {0};
   app.side = parse_side(side_str);
@@ -449,18 +511,30 @@ int main(int argc, char **argv) {
   }
   wl_registry_add_listener(app.registry, &registry_listener, &app);
 
-  // Populate globals and output size.
-  wl_display_roundtrip(app.display);
-  wl_display_roundtrip(app.display);
-
-  if (!app.layer_shell) {
-    dief("compositor missing zwlr_layer_shell_v1 (wlroots layer-shell)");
+  // Populate globals, then wait for an output current mode.
+  //
+  // On some compositors (notably Sway when its VT is inactive), wl_output may
+  // exist but not report a current mode yet. Rather than exiting and forcing
+  // a restart loop, keep the helper alive and wait for the mode to appear.
+  bool ready = false;
+  while (!g_stop) {
+    if (app.compositor && app.shm && app.layer_shell && app.have_output && app.out.have_current_mode) {
+      ready = true;
+      break;
+    }
+    if (pump_events(app.display, 1000) < 0) {
+      break;
+    }
+  }
+  if (!g_stop && ready) {
+    if (!app.layer_shell) {
+      dief("compositor missing zwlr_layer_shell_v1 (wlroots layer-shell)");
+    }
+    create_surface(&app);
   }
 
-  create_surface(&app);
-
   while (!g_stop) {
-    if (wl_display_dispatch(app.display) < 0) {
+    if (pump_events(app.display, 1000) < 0) {
       break;
     }
   }

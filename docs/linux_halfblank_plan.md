@@ -48,7 +48,15 @@ Implementation options (pick the first that works on b0xx):
    This doesn’t require DRM master (Xorg remains DRM master), yet produces a real “bottom half goes black” visual effect and a WM-usable work area that matches Windows semantics.
    - orientation: when the detachable display is rotated “on its side”, rotate the output (and remap touchscreen coordinates) based on iio-sensor-proxy. This is separate from halfblank and should generally be active when undocked/full.
      - note (2026‑01‑09): if rotation feels “sluggish” with several seconds of black screen, check `journalctl _SYSTEMD_USER_UNIT=x1fold-halfblank-ui.service` for repeated `x11_rotated` events (e.g., “from_rotation=normal → rotation=left” looping). That symptom was caused by a bug parsing `xrandr --query` (reading the capability list `(normal left …)` instead of the current rotation token); ensure `/usr/local/bin/x1fold_halfblank_ui.py` matches the repo version.
-4. **Wayland (wlroots) integration (implemented):** create a layer-shell surface over the blank region and set `exclusive_zone` so normal windows avoid it (`x1fold_wl_blank`, requires compositor support for `zwlr_layer_shell_v1`).
+4. **Wayland compositor-native crop (Sway/wlroots; planned):** implement “halfblank” inside the compositor so the bottom region behaves as **not part of the desktop**:
+   - windows/fullscreen never use it,
+   - pointer cannot enter it (compositor-level clamp),
+   - compositor renders black outside the active region,
+   - (optional) wlroots DRM backend applies a primary-plane clip for extra efficiency.
+   This is the closest match to the X11 semantics and removes reliance on a client-side overlay. See `docs/sway_wlroots_halfblank_patch_plan.md`.
+5. **Wayland (wlroots) integration (implemented):** create a layer-shell surface over the blank region and set `exclusive_zone` so normal windows avoid it (`x1fold_wl_blank`, requires compositor support for `zwlr_layer_shell_v1`).
+   - rotation (Sway): `x1fold_halfblank_ui.py` can also read iio-sensor-proxy orientation and apply `swaymsg output <output> transform <normal|90|180|270>`.
+     - policy: auto-rotate only when **undocked/full**, and force `normal` while **docked/half** (keeps halfblank behavior bottom-only).
 
 ## Deliverables (sustainable + installable)
 1. `x1fold/tools/x1fold_mode.py`

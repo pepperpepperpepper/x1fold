@@ -15,6 +15,10 @@ real "bottom half goes black" visual effect.
 Wayland support is implemented for wlroots-based compositors via a layer-shell
 helper (x1fold_wl_blank). Other Wayland compositors may not implement the
 required protocol; in that case we log and keep retrying.
+
+If Sway has been patched with the X1 Fold "true shorter output" command
+(`output <name> x1fold_halfblank ...`), we prefer that (compositor-native crop)
+and fall back to the layer-shell helper only when unsupported.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -152,6 +157,64 @@ def _sensorproxy_orientation() -> str | None:
     return s or None
 
 
+class SensorClaim:
+    """
+    Keep iio-sensor-proxy's accelerometer "claimed" while auto-rotate is needed.
+
+    iio-sensor-proxy may power down sensors when no clients claim them. A one-shot
+    ClaimAccelerometer call is typically not enough because the claim is tied to
+    the D-Bus connection lifetime.
+    """
+
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen[str] | None = None
+        self.available: bool | None = None
+
+    def _have_monitor_sensor(self) -> bool:
+        if self.available is not None:
+            return bool(self.available)
+        self.available = bool(shutil.which("monitor-sensor"))
+        return bool(self.available)
+
+    def running(self) -> bool:
+        return bool(self.proc and self.proc.poll() is None)
+
+    def start(self) -> bool:
+        if self.running():
+            return False
+        if not self._have_monitor_sensor():
+            return False
+        try:
+            self.proc = subprocess.Popen(
+                ["monitor-sensor", "--accel"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError as exc:
+            _log("sensor_claim_start_failed", error=f"{type(exc).__name__}: {exc}")
+            self.proc = None
+            self.available = False
+            return False
+        return True
+
+    def stop(self) -> bool:
+        if not self.proc:
+            return False
+        try:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=1.0)
+        finally:
+            self.proc = None
+        return True
+
+
 def _sensorproxy_to_xrandr_rotation(orientation: str) -> str | None:
     # iio-sensor-proxy -> XRandR rotation mapping:
     # - "left-up"  means the device left edge is up -> rotate output left
@@ -159,6 +222,146 @@ def _sensorproxy_to_xrandr_rotation(orientation: str) -> str | None:
     # - "bottom-up" means device is upside down -> inverted
     mapping = {"normal": "normal", "left-up": "left", "right-up": "right", "bottom-up": "inverted"}
     return mapping.get(orientation)
+
+
+def _sensorproxy_to_sway_transform(orientation: str) -> str | None:
+    # iio-sensor-proxy -> sway output transform mapping.
+    #
+    # Sway uses a degrees-based transform:
+    # - 90: rotate clockwise
+    # - 270: rotate counter-clockwise
+    mapping = {"normal": "normal", "right-up": "90", "bottom-up": "180", "left-up": "270"}
+    return mapping.get(orientation)
+
+
+def _detect_sway_socket() -> str | None:
+    env = (os.environ.get("SWAYSOCK") or "").strip()
+    if env:
+        p = Path(env)
+        try:
+            if p.is_socket():
+                return str(p)
+        except OSError:
+            pass
+
+    runtime = (os.environ.get("XDG_RUNTIME_DIR") or "").strip()
+    if not runtime:
+        runtime = f"/run/user/{os.getuid()}"
+    root = Path(runtime)
+    try:
+        candidates = sorted(
+            (p for p in root.glob("sway-ipc.*.sock") if p.exists()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for p in candidates:
+        try:
+            if p.is_socket():
+                return str(p)
+        except OSError:
+            continue
+    return None
+
+
+def _swaymsg(sock: str, argv: list[str]) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["SWAYSOCK"] = sock
+    return subprocess.run(["swaymsg", *argv], check=False, capture_output=True, text=True, env=env)
+
+
+def _sway_outputs(sock: str) -> list[dict[str, Any]] | None:
+    proc = _swaymsg(sock, ["-t", "get_outputs", "-r"])
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, list):
+        return [o for o in data if isinstance(o, dict)]
+    return None
+
+
+def _sway_pick_output(outputs: list[dict[str, Any]], preferred: str | None) -> str | None:
+    if preferred:
+        return preferred
+    active = [o for o in outputs if bool(o.get("active")) and isinstance(o.get("name"), str)]
+    for o in active:
+        name = str(o.get("name") or "")
+        if name.startswith("eDP-") or name.startswith("eDP"):
+            return name
+    if active:
+        return str(active[0].get("name") or "")
+    return None
+
+
+def _sway_output_transform(outputs: list[dict[str, Any]], output: str) -> str | None:
+    for o in outputs:
+        if str(o.get("name") or "") != output:
+            continue
+        t = o.get("transform")
+        if isinstance(t, str) and t:
+            return t
+        if isinstance(t, int):
+            return str(int(t))
+        return None
+    return None
+
+
+def _sway_set_transform(sock: str, *, output: str, transform: str) -> tuple[bool, str]:
+    allowed = {
+        "normal",
+        "90",
+        "180",
+        "270",
+        "flipped",
+        "flipped-90",
+        "flipped-180",
+        "flipped-270",
+    }
+    if transform not in allowed:
+        return False, f"invalid sway transform: {transform}"
+    proc = _swaymsg(sock, ["output", str(output), "transform", str(transform)])
+    if proc.returncode == 0:
+        return True, ""
+    msg = (proc.stderr or proc.stdout).strip() or f"swaymsg failed (rc={proc.returncode})"
+    return False, msg
+
+
+def _sway_set_x1fold_halfblank(sock: str, *, output: str, desired: str, active_size: int) -> tuple[bool, str]:
+    if desired == "half":
+        if int(active_size) <= 0:
+            return False, "active_size must be > 0"
+        proc = _swaymsg(
+            sock,
+            ["output", str(output), "x1fold_halfblank", "enable", str(int(active_size))],
+        )
+    else:
+        proc = _swaymsg(sock, ["output", str(output), "x1fold_halfblank", "disable"])
+
+    if proc.returncode == 0:
+        return True, ""
+    msg = (proc.stderr or proc.stdout).strip() or f"swaymsg failed (rc={proc.returncode})"
+    return False, msg
+
+
+def _sway_halfblank_unsupported(err: str) -> bool:
+    s = (err or "").strip().lower()
+    if not s:
+        return False
+    if "x1fold_halfblank" not in s:
+        return False
+    needles = [
+        "invalid output subcommand",
+        "unknown command",
+        "unknown/invalid command",
+        "unknown",
+        "unsupported",
+    ]
+    return any(n in s for n in needles)
+
 
 def _xinput_list(display: str) -> list[tuple[int, str]]:
     env = dict(os.environ)
@@ -528,6 +731,35 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Force XRandR rotation to 'normal' while halfblank is active (default: off).",
     )
+    p.add_argument("--sway-output", default="", help="Sway output override (default: auto pick eDP-*).")
+    p.add_argument(
+        "--sway-auto-rotate",
+        action="store_true",
+        help="Auto-rotate Sway output based on iio-sensor-proxy (default: off).",
+    )
+    p.add_argument(
+        "--sway-auto-rotate-interval-s",
+        type=float,
+        default=0.5,
+        help="Polling interval for iio-sensor-proxy orientation (default: 0.5).",
+    )
+    p.add_argument(
+        "--sway-auto-rotate-min-apply-s",
+        type=float,
+        default=1.0,
+        help="Minimum time between applying Sway rotations from sensors (default: 1.0).",
+    )
+    p.add_argument(
+        "--sway-auto-rotate-stable-s",
+        type=float,
+        default=0.0,
+        help="Require sensor orientation to be stable for this many seconds before applying a Sway rotation (default: 0.0).",
+    )
+    p.add_argument(
+        "--sway-force-normal-when-half",
+        action="store_true",
+        help="Force Sway output transform to 'normal' while halfblank is active (default: off).",
+    )
     p.add_argument(
         "--x11-xinput-regex",
         default=r"WACF2200|Wacom|Touchscreen",
@@ -580,17 +812,21 @@ def main(argv: list[str]) -> int:
         interval_s=args.interval_s,
         once=bool(args.once),
         x11_auto_rotate=bool(args.x11_auto_rotate),
+        sway_auto_rotate=bool(args.sway_auto_rotate),
     )
 
-    last_key: tuple[str | None, float | None, str | None, str | None] = (None, None, None, None)  # (desired, mtime, backend, rotation)
+    last_key: tuple[object, ...] = ()
     x11_blanker = X11Blanker()
     wl_blanker = WaylandBlanker()
     last_sensor_check = 0.0
     last_sensor_orientation: str | None = None
     last_sensor_orientation_change = 0.0
     last_x11_rotate_apply = 0.0
-    if args.x11_auto_rotate:
-        _sensorproxy_claim()
+    last_sway_rotate_apply = 0.0
+    sway_halfblank_supported: bool | None = None
+    last_sway_sock: str | None = None
+    sensor_claim = SensorClaim()
+    sensor_claim_enabled = False
 
     while True:
         st = _read_state(args.state_file)
@@ -617,23 +853,248 @@ def main(argv: list[str]) -> int:
             continue
 
         use_wayland = _is_wayland_session() and not bool(args.no_wayland)
+        want_sensor = bool(
+            desired == "full"
+            and docked in (0, None)
+            and (
+                (use_wayland and bool(args.sway_auto_rotate))
+                or ((not use_wayland) and bool(args.x11_auto_rotate))
+            )
+        )
+        if want_sensor:
+            if not sensor_claim_enabled:
+                sensor_claim_enabled = True
+                _sensorproxy_claim()
+                started = sensor_claim.start()
+                _log(
+                    "sensor_claim_enabled",
+                    started=bool(started),
+                    running=bool(sensor_claim.running()),
+                )
+            elif not sensor_claim.running():
+                started = sensor_claim.start()
+                if started:
+                    _log("sensor_claim_restarted", running=bool(sensor_claim.running()))
+        elif sensor_claim_enabled:
+            sensor_claim_enabled = False
+            stopped = sensor_claim.stop()
+            _log("sensor_claim_disabled", stopped=bool(stopped))
+
         if use_wayland:
             if x11_blanker_running:
                 x11_blanker.stop()
                 x11_blanker_running = False
 
-            key = (desired, mtime, "wayland", None)
+            now = time.monotonic()
+            sway_sock = _detect_sway_socket()
+            if sway_sock != last_sway_sock:
+                last_sway_sock = sway_sock
+                sway_halfblank_supported = None
+            outputs = _sway_outputs(sway_sock) if sway_sock else None
+            sway_output: str | None = None
+            sway_transform: str | None = None
+            if outputs:
+                sway_output = _sway_pick_output(outputs, args.sway_output or None)
+                if sway_output:
+                    sway_transform = _sway_output_transform(outputs, sway_output) or "unknown"
+
+            want_sway_rotation = False
+            if desired == "half" and args.sway_force_normal_when_half:
+                want_sway_rotation = True
+            elif args.sway_auto_rotate and desired == "full" and (docked in (0, None)):
+                want_sway_rotation = True
+
+            if want_sway_rotation:
+                target_transform: str | None = None
+                target_transform_reason: str | None = None
+                if sway_sock and sway_output and desired == "half" and args.sway_force_normal_when_half:
+                    target_transform = "normal"
+                    target_transform_reason = "force_normal_when_half"
+                elif sway_sock and sway_output and args.sway_auto_rotate and desired == "full" and (docked in (0, None)):
+                    if (now - last_sensor_check) >= float(args.sway_auto_rotate_interval_s):
+                        last_sensor_check = now
+                        ori = _sensorproxy_orientation()
+                        if ori:
+                            if ori != last_sensor_orientation:
+                                last_sensor_orientation = ori
+                                stable_s = float(args.sway_auto_rotate_stable_s or 0.0)
+                                if last_sensor_orientation_change == 0.0 and stable_s > 0:
+                                    last_sensor_orientation_change = now - stable_s
+                                else:
+                                    last_sensor_orientation_change = now
+                        target_transform = _sensorproxy_to_sway_transform(ori) if ori else None
+                        target_transform_reason = "sensor"
+
+                if (
+                    sway_sock
+                    and sway_output
+                    and sway_transform
+                    and target_transform
+                    and target_transform != sway_transform
+                ):
+                    min_apply_s = float(args.sway_auto_rotate_min_apply_s or 0.0)
+                    if (
+                        target_transform_reason == "sensor"
+                        and min_apply_s > 0
+                        and (now - last_sway_rotate_apply) < min_apply_s
+                    ):
+                        _log(
+                            "sway_rotate_rate_limited",
+                            output=sway_output,
+                            from_transform=sway_transform,
+                            desired_transform=target_transform,
+                            sensor_orientation=last_sensor_orientation,
+                            docked=docked,
+                            desired=desired,
+                            since_last_apply_s=round(now - last_sway_rotate_apply, 3),
+                            min_apply_s=min_apply_s,
+                        )
+                    else:
+                        stable_s = float(args.sway_auto_rotate_stable_s or 0.0)
+                        if (
+                            target_transform_reason == "sensor"
+                            and stable_s > 0
+                            and (now - last_sensor_orientation_change) < stable_s
+                        ):
+                            _log(
+                                "sway_rotate_debounced",
+                                output=sway_output,
+                                from_transform=sway_transform,
+                                desired_transform=target_transform,
+                                sensor_orientation=last_sensor_orientation,
+                                docked=docked,
+                                desired=desired,
+                                since_change_s=round(now - last_sensor_orientation_change, 3),
+                                stable_s=stable_s,
+                            )
+                        else:
+                            rot_start = time.monotonic()
+                            ok, err = _sway_set_transform(sway_sock, output=sway_output, transform=target_transform)
+                            rot_elapsed_s = round(time.monotonic() - rot_start, 3)
+                            if ok:
+                                _log(
+                                    "sway_rotated",
+                                    output=sway_output,
+                                    from_transform=sway_transform,
+                                    transform=target_transform,
+                                    sensor_orientation=last_sensor_orientation,
+                                    docked=docked,
+                                    desired=desired,
+                                    elapsed_s=rot_elapsed_s,
+                                    reason=target_transform_reason,
+                                )
+                                sway_transform = target_transform
+                                last_sway_rotate_apply = time.monotonic()
+                            else:
+                                _log(
+                                    "sway_rotate_failed",
+                                    output=sway_output,
+                                    from_transform=sway_transform,
+                                    desired_transform=target_transform,
+                                    sensor_orientation=last_sensor_orientation,
+                                    docked=docked,
+                                    desired=desired,
+                                    error=err,
+                                    elapsed_s=rot_elapsed_s,
+                                    reason=target_transform_reason,
+                                )
+
+            halfblank_method = "layer_shell"
+            if sway_sock and sway_output and sway_halfblank_supported is not False:
+                halfblank_method = "sway_crop"
+
+            key = (
+                desired,
+                mtime,
+                "wayland",
+                sway_transform,
+                halfblank_method,
+                sway_output,
+                sway_sock,
+            )
             same_key = key == last_key
-            if same_key and desired == "half" and not wl_blanker_running:
-                same_key = False
-            if same_key and desired == "full" and wl_blanker_running:
-                same_key = False
+            if halfblank_method == "layer_shell":
+                if same_key and desired == "half" and not wl_blanker_running:
+                    same_key = False
+                if same_key and desired == "full" and wl_blanker_running:
+                    same_key = False
+            else:
+                # When using the compositor-native crop, the layer-shell helper
+                # must not be running.
+                if same_key and wl_blanker_running:
+                    same_key = False
             if same_key:
                 if args.once:
                     return 0
                 time.sleep(args.interval_s)
                 continue
             last_key = key
+
+            if halfblank_method == "sway_crop":
+                if wl_blanker_running:
+                    wl_blanker.stop()
+                    wl_blanker_running = False
+
+                if not sway_sock or not sway_output:
+                    ok, err = False, "failed to resolve SWAYSOCK/output for sway crop"
+                else:
+                    hb_start = time.monotonic()
+                    ok, err = _sway_set_x1fold_halfblank(
+                        sway_sock,
+                        output=sway_output,
+                        desired=desired,
+                        active_size=int(args.active_size),
+                    )
+                    hb_elapsed_s = round(time.monotonic() - hb_start, 3)
+                    if ok:
+                        sway_halfblank_supported = True
+                        _log(
+                            "applied",
+                            desired=desired,
+                            backend="wayland",
+                            method="sway_crop",
+                            docked=docked,
+                            output=sway_output,
+                            transform=sway_transform,
+                            elapsed_s=hb_elapsed_s,
+                        )
+                        if args.once:
+                            return 0
+                        time.sleep(args.interval_s)
+                        continue
+
+                    _log(
+                        "sway_halfblank_failed",
+                        desired=desired,
+                        docked=docked,
+                        output=sway_output,
+                        error=err,
+                        elapsed_s=hb_elapsed_s,
+                    )
+
+                    if desired == "half" or _sway_halfblank_unsupported(err):
+                        # Avoid oscillating between sway_crop and layer-shell
+                        # on every poll; retry only when SWAYSOCK changes.
+                        sway_halfblank_supported = False
+                        # If the command is missing, "full" is already the
+                        # default. Only fall back for "half".
+                        if desired == "full":
+                            _log(
+                                "applied",
+                                desired=desired,
+                                backend="wayland",
+                                method="none",
+                                docked=docked,
+                                output=sway_output,
+                                transform=sway_transform,
+                            )
+                            if args.once:
+                                return 0
+                            time.sleep(args.interval_s)
+                            continue
+
+                    # Fall back to layer-shell (best-effort).
+                    halfblank_method = "layer_shell"
 
             ok, err = _apply_wayland(
                 desired,
@@ -643,7 +1104,28 @@ def main(argv: list[str]) -> int:
                 name=str(args.wayland_blank_name),
             )
             if ok:
-                _log("applied", desired=desired, backend="wayland", docked=docked, blank_helper=str(args.wayland_blank_helper))
+                # If we fell back from sway_crop, update last_key so we don't
+                # immediately retry sway_crop on the next loop.
+                if halfblank_method != key[4]:
+                    last_key = (
+                        desired,
+                        mtime,
+                        "wayland",
+                        sway_transform,
+                        halfblank_method,
+                        sway_output,
+                        sway_sock,
+                    )
+                _log(
+                    "applied",
+                    desired=desired,
+                    backend="wayland",
+                    method=halfblank_method,
+                    docked=docked,
+                    output=sway_output,
+                    transform=sway_transform,
+                    blank_helper=str(args.wayland_blank_helper),
+                )
                 if args.once:
                     return 0
                 time.sleep(args.interval_s)
