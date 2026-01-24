@@ -363,6 +363,87 @@ def _sway_halfblank_unsupported(err: str) -> bool:
     return any(n in s for n in needles)
 
 
+def _sway_inputs(sock: str) -> list[dict[str, Any]] | None:
+    proc = _swaymsg(sock, ["-t", "get_inputs", "-r"])
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, list):
+        return [i for i in data if isinstance(i, dict)]
+    return None
+
+
+def _sway_output_current_mode(outputs: list[dict[str, Any]], output: str) -> tuple[int, int] | None:
+    for o in outputs:
+        if str(o.get("name") or "") != output:
+            continue
+        cm = o.get("current_mode")
+        if not isinstance(cm, dict):
+            return None
+        w = cm.get("width")
+        h = cm.get("height")
+        if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+            return (int(w), int(h))
+        return None
+    return None
+
+
+def _fmt_frac(v: float) -> str:
+    s = f"{float(v):.6f}".rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def _sway_set_input_map_from_region(
+    sock: str,
+    *,
+    identifier: str,
+    p1: str,
+    p2: str,
+) -> tuple[bool, str]:
+    proc = _swaymsg(sock, ["input", str(identifier), "map_from_region", str(p1), str(p2)])
+    if proc.returncode == 0:
+        return True, ""
+    msg = (proc.stderr or proc.stdout).strip() or f"swaymsg failed (rc={proc.returncode})"
+    return False, msg
+
+
+def _sway_set_x1fold_touch_map_from_region(sock: str, *, p1: str, p2: str) -> tuple[bool, str]:
+    """
+    Apply Sway's map_from_region to the X1 Fold internal touch + pen inputs.
+    """
+
+    inputs = _sway_inputs(sock)
+    if not inputs:
+        return False, "failed to read sway inputs"
+
+    ids: list[str] = []
+    for i in inputs:
+        ident = i.get("identifier")
+        if not (isinstance(ident, str) and ident):
+            continue
+        if i.get("vendor") != 1386 or i.get("product") != 21178:
+            continue
+        if i.get("type") not in {"touch", "tablet_tool"}:
+            continue
+        ids.append(ident)
+
+    if not ids:
+        return False, "no matching x1fold touch inputs"
+
+    errs: list[str] = []
+    for ident in ids:
+        ok, err = _sway_set_input_map_from_region(sock, identifier=ident, p1=p1, p2=p2)
+        if not ok:
+            errs.append(f"{ident}: {err}")
+
+    if errs:
+        return False, "; ".join(errs)
+    return True, ""
+
+
 def _xinput_list(display: str) -> list[tuple[int, str]]:
     env = dict(os.environ)
     env["DISPLAY"] = display
@@ -761,6 +842,24 @@ def main(argv: list[str]) -> int:
         help="Force Sway output transform to 'normal' while halfblank is active (default: off).",
     )
     p.add_argument(
+        "--sway-halfblank-method",
+        choices=["auto", "sway_crop", "layer_shell"],
+        default="auto",
+        help="Wayland halfblank method under Sway (default: auto).",
+    )
+    p.add_argument(
+        "--sway-touch-top-margin-px",
+        type=int,
+        default=0,
+        help="Ignore this many pixels at the top of the internal touch/pen in sway_crop half mode (default: 0).",
+    )
+    p.add_argument(
+        "--sway-touch-bottom-margin-px",
+        type=int,
+        default=0,
+        help="Ignore this many pixels at the bottom of the internal touch/pen in sway_crop half mode (default: 0).",
+    )
+    p.add_argument(
         "--x11-xinput-regex",
         default=r"WACF2200|Wacom|Touchscreen",
         help="Regex for xinput devices to map after rotation (default: WACF2200|Wacom|Touchscreen).",
@@ -1000,8 +1099,14 @@ def main(argv: list[str]) -> int:
                                 )
 
             halfblank_method = "layer_shell"
-            if sway_sock and sway_output and sway_halfblank_supported is not False:
-                halfblank_method = "sway_crop"
+            if args.sway_halfblank_method == "layer_shell":
+                halfblank_method = "layer_shell"
+            elif args.sway_halfblank_method == "sway_crop":
+                if sway_sock and sway_output and sway_halfblank_supported is not False:
+                    halfblank_method = "sway_crop"
+            else:
+                if sway_sock and sway_output and sway_halfblank_supported is not False:
+                    halfblank_method = "sway_crop"
 
             key = (
                 desired,
@@ -1048,6 +1153,84 @@ def main(argv: list[str]) -> int:
                     hb_elapsed_s = round(time.monotonic() - hb_start, 3)
                     if ok:
                         sway_halfblank_supported = True
+                        # When we crop the output (sway_crop), wlroots still
+                        # sees the touch device's full ABS range. In practice
+                        # the device often reports only the "active" top
+                        # portion while docked, so we must remap that region
+                        # to the full visible output to avoid a coordinate
+                        # mismatch.
+                        if sway_sock and desired == "half":
+                            mode = _sway_output_current_mode(outputs, sway_output) if outputs else None
+                            if mode:
+                                _, full_h = mode
+                                top_margin = max(0, int(args.sway_touch_top_margin_px or 0))
+                                bottom_margin = max(0, int(args.sway_touch_bottom_margin_px or 0))
+                                y1_px = top_margin
+                                y2_px = int(args.active_size) - bottom_margin
+                                if y2_px <= y1_px:
+                                    _log(
+                                        "sway_touch_map_from_region_failed",
+                                        desired=desired,
+                                        output=sway_output,
+                                        active_size=int(args.active_size),
+                                        top_margin_px=int(top_margin),
+                                        bottom_margin_px=int(bottom_margin),
+                                        full_h=int(full_h),
+                                        error="invalid sway touch margins: active_size must be > top+bottom",
+                                    )
+                                else:
+                                    y1 = float(y1_px) / float(full_h)
+                                    y2 = float(y2_px) / float(full_h)
+                                    y1 = max(0.0, min(1.0, y1))
+                                    y2 = max(0.0, min(1.0, y2))
+                                    p1, p2 = f"0x{_fmt_frac(y1)}", f"1x{_fmt_frac(y2)}"
+                                    tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(
+                                        sway_sock,
+                                        p1=p1,
+                                        p2=p2,
+                                    )
+                                    if tm_ok:
+                                        _log(
+                                            "sway_touch_map_from_region_applied",
+                                            desired=desired,
+                                            output=sway_output,
+                                            p1=p1,
+                                            p2=p2,
+                                            active_size=int(args.active_size),
+                                            top_margin_px=int(top_margin),
+                                            bottom_margin_px=int(bottom_margin),
+                                            full_h=int(full_h),
+                                        )
+                                    else:
+                                        _log(
+                                            "sway_touch_map_from_region_failed",
+                                            desired=desired,
+                                            output=sway_output,
+                                            p1=p1,
+                                            p2=p2,
+                                            active_size=int(args.active_size),
+                                            top_margin_px=int(top_margin),
+                                            bottom_margin_px=int(bottom_margin),
+                                            full_h=int(full_h),
+                                            error=tm_err,
+                                        )
+                            else:
+                                _log(
+                                    "sway_touch_map_from_region_failed",
+                                    desired=desired,
+                                    output=sway_output,
+                                    active_size=int(args.active_size),
+                                    error="failed to read sway output current_mode",
+                                )
+                        elif sway_sock:
+                            tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(sway_sock, p1="0x0", p2="1x1")
+                            if not tm_ok:
+                                _log(
+                                    "sway_touch_map_reset_failed",
+                                    desired=desired,
+                                    output=sway_output,
+                                    error=tm_err,
+                                )
                         _log(
                             "applied",
                             desired=desired,
@@ -1079,6 +1262,15 @@ def main(argv: list[str]) -> int:
                         # If the command is missing, "full" is already the
                         # default. Only fall back for "half".
                         if desired == "full":
+                            if sway_sock:
+                                tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(sway_sock, p1="0x0", p2="1x1")
+                                if not tm_ok:
+                                    _log(
+                                        "sway_touch_map_reset_failed",
+                                        desired=desired,
+                                        output=sway_output,
+                                        error=tm_err,
+                                    )
                             _log(
                                 "applied",
                                 desired=desired,
@@ -1096,6 +1288,25 @@ def main(argv: list[str]) -> int:
                     # Fall back to layer-shell (best-effort).
                     halfblank_method = "layer_shell"
 
+            if halfblank_method == "layer_shell" and sway_sock and sway_output:
+                # Ensure any compositor-native crop is disabled so the output
+                # keeps its full size; the layer-shell blanker reserves the
+                # bottom region via exclusive_zone instead.
+                ok2, err2 = _sway_set_x1fold_halfblank(
+                    sway_sock,
+                    output=sway_output,
+                    desired="full",
+                    active_size=int(args.active_size),
+                )
+                if not ok2 and not _sway_halfblank_unsupported(err2):
+                    _log(
+                        "sway_halfblank_disable_failed",
+                        desired=desired,
+                        docked=docked,
+                        output=sway_output,
+                        error=err2,
+                    )
+
             ok, err = _apply_wayland(
                 desired,
                 blanker=wl_blanker,
@@ -1104,6 +1315,15 @@ def main(argv: list[str]) -> int:
                 name=str(args.wayland_blank_name),
             )
             if ok:
+                if sway_sock:
+                    tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(sway_sock, p1="0x0", p2="1x1")
+                    if not tm_ok:
+                        _log(
+                            "sway_touch_map_reset_failed",
+                            desired=desired,
+                            output=sway_output,
+                            error=tm_err,
+                        )
                 # If we fell back from sway_crop, update last_key so we don't
                 # immediately retry sway_crop on the next loop.
                 if halfblank_method != key[4]:

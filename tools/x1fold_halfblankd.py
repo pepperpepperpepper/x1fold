@@ -200,6 +200,12 @@ def main(argv: list[str]) -> int:
         default="auto",
         help="Backend for reading dock state (default: auto).",
     )
+    parser.add_argument(
+        "--dock-sysfs",
+        type=Path,
+        default=Path("/sys/devices/platform/dock.0/docked"),
+        help="Optional sysfs dock state file (default: /sys/devices/platform/dock.0/docked).",
+    )
     parser.add_argument("--acpi-call", type=Path, default=Path("/proc/acpi/call"), help="Path to /proc/acpi/call.")
     parser.add_argument("--gdst", default=r"\_SB.DEVD.GDST", help="ACPI path for dock getter (default: \\_SB.DEVD.GDST).")
     parser.add_argument(
@@ -263,6 +269,22 @@ def main(argv: list[str]) -> int:
         help="Digitizer backend for x1fold_mode.py set (default: auto).",
     )
     parser.add_argument(
+        "--digitizer-mode-in-half",
+        choices=["half", "full"],
+        default="half",
+        help=(
+            "Digitizer mode to apply when the desired UI state is half (default: half). "
+            "Use 'full' when halfblank is implemented via a Wayland exclusive-zone blanker "
+            "(no output crop), to avoid touch coordinate scaling."
+        ),
+    )
+    parser.add_argument(
+        "--digitizer-mode-in-full",
+        choices=["half", "full"],
+        default="full",
+        help="Digitizer mode to apply when the desired UI state is full (default: full).",
+    )
+    parser.add_argument(
         "--display",
         choices=["auto", "none", "drm", "x11"],
         default="auto",
@@ -315,6 +337,21 @@ def main(argv: list[str]) -> int:
         _log("dmi_skip", require_x1fold=True, dmi=dmi)
         return 0
 
+    if args.display != "none" and (
+        args.digitizer_mode_in_half != "half" or args.digitizer_mode_in_full != "full"
+    ):
+        _log(
+            "invalid_digitizer_mode_combo",
+            display=args.display,
+            digitizer_mode_in_half=args.digitizer_mode_in_half,
+            digitizer_mode_in_full=args.digitizer_mode_in_full,
+            error="digitizer-mode-* overrides are only supported when --display none is used",
+        )
+        return 2
+
+    def _digitizer_mode_for_desired(desired: str) -> str:
+        return args.digitizer_mode_in_half if desired == "half" else args.digitizer_mode_in_full
+
     def _default_tool_cmd(mode: str) -> list[str]:
         for candidate in (
             Path("/usr/local/bin/x1fold_mode.py"),
@@ -327,8 +364,9 @@ def main(argv: list[str]) -> int:
         else:
             tool = "x1fold_mode.py"
 
-        cmd = [tool, "set", mode, "--digitizer", str(args.digitizer), "--display", str(args.display)]
-        if mode == "half":
+        digitizer_mode = _digitizer_mode_for_desired(mode)
+        cmd = [tool, "set", digitizer_mode, "--digitizer", str(args.digitizer), "--display", str(args.display)]
+        if digitizer_mode == "half":
             cmd += ["--display-height", str(int(args.display_height))]
         if args.drm_clip:
             cmd += ["--drm-clip", str(args.drm_clip)]
@@ -415,6 +453,7 @@ def main(argv: list[str]) -> int:
             cmmd_path=args.cmmd,
             ec_io=args.ec_io,
             ec_offset=args.ec_offset,
+            dock_sysfs=args.dock_sysfs,
         )
         if state.docked not in (0, 1):
             # We can't act without a stable signal; keep polling.
@@ -494,6 +533,7 @@ def main(argv: list[str]) -> int:
             if enforce_every_s > 0 and (now - last_enforce_ts) >= enforce_every_s:
                 last_enforce_ts = now
                 desired = "half" if state.docked else "full"
+                expected_digitizer_mode = _digitizer_mode_for_desired(desired)
                 status, err = run_status(cmds.status, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
                 current = _status_mode(status) if status else None
                 if err:
@@ -509,7 +549,7 @@ def main(argv: list[str]) -> int:
                             "status_error": err,
                         },
                     )
-                elif current != desired:
+                elif current != expected_digitizer_mode:
                     rc = run_cmd(
                         cmds.half if state.docked else cmds.full,
                         dry_run=args.dry_run,
@@ -527,7 +567,8 @@ def main(argv: list[str]) -> int:
                         docked=state.docked,
                         modeid=state.modeid,
                         desired=desired,
-                        observed=current,
+                        digitizer_expected=expected_digitizer_mode,
+                        digitizer_observed=current,
                         rc=rc,
                         tty_rc=rc_tty,
                         since_last_apply_s=round(now - last_apply_ts, 3),
@@ -540,7 +581,8 @@ def main(argv: list[str]) -> int:
                             "dmi": dmi,
                             "dock": state.__dict__,
                             "desired": desired,
-                            "observed": current,
+                            "digitizer_expected": expected_digitizer_mode,
+                            "digitizer_observed": current,
                             "apply_rc": rc,
                             "tty_rc": rc_tty,
                             "status": status,

@@ -4,7 +4,7 @@ Description=Lenovo X1 Fold halfblank UI helper (apply display geometry)
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/x1fold-halfblank-ui-session --state-file /run/x1fold-halfblank/state.json --interval-s 1.0 --x11-auto-rotate --x11-auto-rotate-stable-s 0.8 --x11-force-normal-when-half --sway-auto-rotate --sway-auto-rotate-stable-s 0.8 --sway-force-normal-when-half
+ExecStart=/usr/local/bin/x1fold-halfblank-ui-session --state-file /run/x1fold-halfblank/state.json --interval-s 1.0 --x11-auto-rotate --x11-auto-rotate-stable-s 0.8 --x11-force-normal-when-half --sway-auto-rotate --sway-auto-rotate-stable-s 0.8 --sway-force-normal-when-half --sway-halfblank-method layer_shell
 Restart=on-failure
 RestartSec=1
 

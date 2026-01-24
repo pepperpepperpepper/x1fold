@@ -46,6 +46,9 @@ install -Dm0755 "$x1fold_root/tools/x1fold_mode.py" /usr/local/bin/x1fold_mode.p
 install -Dm0755 "$x1fold_root/tools/x1fold_dock.py" /usr/local/bin/x1fold_dock.py
 install -Dm0755 "$x1fold_root/tools/x1fold_halfblankd.py" /usr/local/bin/x1fold_halfblankd.py
 install -Dm0755 "$x1fold_root/tools/x1fold_halfblank_ui.py" /usr/local/bin/x1fold_halfblank_ui.py
+if [[ -f "$x1fold_root/tools/x1fold_touch_probe.py" ]]; then
+  install -Dm0755 "$x1fold_root/tools/x1fold_touch_probe.py" /usr/local/bin/x1fold_touch_probe.py
+fi
 if [[ -f "$x1fold_root/tools/x1fold_tty.py" ]]; then
   install -Dm0755 "$x1fold_root/tools/x1fold_tty.py" /usr/local/bin/x1fold_tty.py
 fi

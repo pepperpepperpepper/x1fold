@@ -30,6 +30,18 @@ DEFAULT_CMMD = r"\_SB.PC00.LPCB.EC.CMMD"
 DEFAULT_ACPI_CALL = Path("/proc/acpi/call")
 DEFAULT_EC_IO = Path("/sys/kernel/debug/ec/ec0/io")
 DEFAULT_EC_OFFSET = 0xC1
+DEFAULT_DOCK_SYSFS = Path("/sys/devices/platform/dock.0/docked")
+
+
+def _read_int_file(path: Path) -> int | None:
+    try:
+        s = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    try:
+        return int(s, 0)
+    except ValueError:
+        return None
 
 
 def utc_iso() -> str:
@@ -79,6 +91,7 @@ class DockState:
     modeid: int | None
     cmmd: int | None
     gdst: int | None
+    dock_sysfs: int | None
     errors: dict[str, str]
 
     def to_json(self) -> dict[str, Any]:
@@ -87,6 +100,7 @@ class DockState:
             "modeid": self.modeid,
             "cmmd": self.cmmd,
             "gdst": self.gdst,
+            "dock_sysfs": self.dock_sysfs,
             "errors": dict(self.errors),
         }
 
@@ -99,6 +113,7 @@ def read_dock_state(
     cmmd_path: str,
     ec_io: Path,
     ec_offset: int,
+    dock_sysfs: Path,
 ) -> DockState:
     errors: dict[str, str] = {}
 
@@ -106,12 +121,19 @@ def read_dock_state(
     cmmd_out: str | None = None
     gdst: int | None = None
     cmmd: int | None = None
+    dock_sysfs_val: int | None = None
 
     backend = backend.strip().lower()
     if backend not in ("auto", "acpi_call", "ec_sys"):
         raise ValueError("backend must be one of: auto, acpi_call, ec_sys")
     if backend == "acpi_call" and not acpi_call_path.exists():
         errors["acpi_call"] = f"{acpi_call_path} missing (need acpi_call kernel module?)"
+
+    if dock_sysfs.exists():
+        dock_sysfs_val = _read_int_file(dock_sysfs)
+        if dock_sysfs_val not in (0, 1):
+            errors["dock_sysfs"] = f"invalid dock sysfs value: {dock_sysfs_val!r}"
+            dock_sysfs_val = None
 
     if backend in ("auto", "acpi_call") and acpi_call_path.exists():
         try:
@@ -144,8 +166,19 @@ def read_dock_state(
         modeid = cmmd & 0x7F
     if gdst in (0, 1):
         docked = gdst
+    # sysfs dock state is a best-effort fallback only. Some platforms expose a
+    # generic ACPI dock device that may not track the X1 Fold keyboard magnet.
+    if docked is None and dock_sysfs_val in (0, 1):
+        docked = dock_sysfs_val
 
-    return DockState(docked=docked, modeid=modeid, cmmd=cmmd, gdst=gdst, errors=errors)
+    return DockState(
+        docked=docked,
+        modeid=modeid,
+        cmmd=cmmd,
+        gdst=gdst,
+        dock_sysfs=dock_sysfs_val,
+        errors=errors,
+    )
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -156,6 +189,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         cmmd_path=args.cmmd,
         ec_io=args.ec_io,
         ec_offset=args.ec_offset,
+        dock_sysfs=args.dock_sysfs,
     )
     out = {
         "ts": utc_iso(),
@@ -163,7 +197,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "acpi_call": str(args.acpi_call),
         "ec_io": str(args.ec_io),
         "ec_offset": f"0x{args.ec_offset:x}",
-        "paths": {"gdst": args.gdst, "cmmd": args.cmmd},
+        "paths": {"dock_sysfs": str(args.dock_sysfs), "gdst": args.gdst, "cmmd": args.cmmd},
         "state": state.to_json(),
     }
     print(json.dumps(out, indent=2, sort_keys=True))
@@ -181,6 +215,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             cmmd_path=args.cmmd,
             ec_io=args.ec_io,
             ec_offset=args.ec_offset,
+            dock_sysfs=args.dock_sysfs,
         )
         if last is None and args.print_initial:
             print(json.dumps({"ts": utc_iso(), "event": "initial", "state": state.to_json()}, sort_keys=True))
@@ -204,6 +239,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "acpi_call", "ec_sys"],
         default="auto",
         help="Backend for reading dock state (default: auto).",
+    )
+    parser.add_argument(
+        "--dock-sysfs",
+        type=Path,
+        default=DEFAULT_DOCK_SYSFS,
+        help="Optional sysfs dock state file (default: /sys/devices/platform/dock.0/docked).",
     )
     parser.add_argument(
         "--acpi-call",

@@ -282,7 +282,7 @@ def hid_get_feature(dev: HidrawDevice, report_id: int, size: int) -> bytes:
             return bytes(buf)
         except OSError as exc:
             last_exc = exc
-            if exc.errno == 110 and attempt < 2:
+            if exc.errno in (110, 121) and attempt < 2:
                 time.sleep(0.15 * (attempt + 1))
                 continue
             raise
@@ -294,12 +294,24 @@ def hid_get_feature(dev: HidrawDevice, report_id: int, size: int) -> bytes:
 
 
 def hid_set_feature(dev: HidrawDevice, report: bytes) -> None:
-    fd = os.open(str(dev.dev), os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
-    try:
-        buf = bytearray(report)
-        fcntl.ioctl(fd, hidiocsfeature(len(buf)), buf, True)
-    finally:
-        os.close(fd)
+    last_exc: OSError | None = None
+    for attempt in range(3):
+        fd = os.open(str(dev.dev), os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+        try:
+            buf = bytearray(report)
+            fcntl.ioctl(fd, hidiocsfeature(len(buf)), buf, True)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if exc.errno in (110, 121) and attempt < 2:
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
+        finally:
+            os.close(fd)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("hid_set_feature failed without exception")
 
 
 def patch_report(report: bytes, offset: int, patch: bytes) -> bytes:
@@ -587,22 +599,53 @@ def cmd_set(args: argparse.Namespace) -> int:
         return failures
 
     def _attempt_hidraw() -> tuple[list[dict[str, Any]], list[str]]:
-        rows, failures = _read_before()
-        if failures:
-            return rows, failures
-        for dev, row in zip(candidates, rows, strict=False):
+        failures: list[str] = []
+        rows: list[dict[str, Any]] = []
+        for dev in candidates:
+            row: dict[str, Any] = dev.to_json()
+            wrote = False
             try:
                 before = hid_get_feature(dev, args.report_id, args.report_len)
-                after = patch_report(before, args.patch_offset, target)
-                row["after_bytes_10_15"] = _hex_bytes(after[args.patch_offset : args.patch_offset + 6])
-                if args.dry_run:
-                    row["dry_run"] = True
+                before_bytes = before[args.patch_offset : args.patch_offset + 6]
+                row["before_mode"] = report_mode(before, args.patch_offset)
+                row["before_bytes_10_15"] = _hex_bytes(before_bytes)
+
+                if before_bytes == target:
+                    row["already"] = True
                 else:
-                    hid_set_feature(dev, after)
+                    after = patch_report(before, args.patch_offset, target)
+                    row["after_bytes_10_15"] = _hex_bytes(after[args.patch_offset : args.patch_offset + 6])
+                    if args.dry_run:
+                        row["dry_run"] = True
+                    else:
+                        hid_set_feature(dev, after)
+                        wrote = True
             except OSError as exc:
-                failures.append(f"{dev.dev}: set failed [{exc.errno}] {exc.strerror}")
-                row["set_error"] = f"[{exc.errno}] {exc.strerror}"
-        failures.extend(_verify(rows))
+                failures.append(f"{dev.dev}: [{exc.errno}] {exc.strerror}")
+                row["error"] = f"[{exc.errno}] {exc.strerror}"
+            row["_wrote"] = wrote
+            rows.append(row)
+
+        if failures:
+            for row in rows:
+                row.pop("_wrote", None)
+            return rows, failures
+
+        for dev, row in zip(candidates, rows, strict=False):
+            if not row.get("_wrote"):
+                continue
+            try:
+                verify = hid_get_feature(dev, args.report_id, args.report_len)
+                row["verify_mode"] = report_mode(verify, args.patch_offset)
+                row["verify_bytes_10_15"] = _hex_bytes(verify[args.patch_offset : args.patch_offset + 6])
+                if verify[args.patch_offset : args.patch_offset + 6] != target:
+                    failures.append(f"{dev.dev}: verify mismatch (got {row['verify_bytes_10_15']})")
+            except OSError as exc:
+                failures.append(f"{dev.dev}: verify failed [{exc.errno}] {exc.strerror}")
+                row["verify_error"] = f"[{exc.errno}] {exc.strerror}"
+
+        for row in rows:
+            row.pop("_wrote", None)
         return rows, failures
 
     def _attempt_i2c() -> tuple[list[dict[str, Any]], list[str]]:
