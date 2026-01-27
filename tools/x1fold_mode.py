@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -479,7 +480,12 @@ def apply_display_mode(args: argparse.Namespace) -> dict[str, Any]:
         return out
 
     if display_mode in ("auto", "drm"):
-        drm_tool = args.drm_clip or "drm_clip"
+        drm_tool = args.drm_clip or shutil.which("drm_clip")
+        if not drm_tool:
+            local = Path(__file__).resolve().with_name("drm_clip")
+            if local.exists() and os.access(local, os.X_OK):
+                drm_tool = str(local)
+        drm_tool = drm_tool or "drm_clip"
         cmd = [drm_tool]
         if args.mode == "half":
             cmd += ["--height", str(int(args.display_height)), "half"]
@@ -532,7 +538,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             entry["error"] = f"[{exc.errno}] {exc.strerror}"
         status["devices"].append(entry)
 
-    # Prefer the Windows-derived I2C query tail as the mode source.
+    # Prefer the Windows-derived I2C query tail as the mode source (when enabled).
     if args.i2c_query:
         i2c_dev = status["i2c_query"]["dev"]
         i2c_addr = int(args.i2c_addr)
@@ -540,8 +546,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             tail = i2c_query_tail(str(i2c_dev), i2c_addr)
             status["i2c_query"]["tail_0x10_0x11"] = _hex_bytes(tail)
             status["i2c_query"]["mode"] = i2c_tail_mode(tail)
-            status["mode"] = status["i2c_query"]["mode"]
-            status["mode_source"] = "i2c_query"
+            if status["i2c_query"]["mode"] in ("half", "full"):
+                status["mode"] = status["i2c_query"]["mode"]
+                status["mode_source"] = "i2c_query"
         except OSError as exc:
             status["i2c_query"]["error"] = f"[{exc.errno}] {exc.strerror}"
         except Exception as exc:
@@ -738,13 +745,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_status = sub.add_parser("status", help="Print current mode and device details as JSON.")
-    p_status.add_argument(
+    p_status_i2c = p_status.add_mutually_exclusive_group()
+    p_status_i2c.add_argument(
+        "--i2c-query",
+        dest="i2c_query",
+        action="store_true",
+        help="Enable the Windows-derived I2C query (w6+r1029).",
+    )
+    p_status_i2c.add_argument(
         "--no-i2c-query",
         dest="i2c_query",
         action="store_false",
-        help="Skip the Windows-derived I2C query (w6+r1029).",
+        help="Disable the Windows-derived I2C query (w6+r1029).",
     )
-    p_status.set_defaults(i2c_query=True)
+    p_status.set_defaults(i2c_query=False)
     p_status.add_argument("--i2c-bus", type=int, default=1, help="I2C bus number for 0x0A query (default: 1).")
     p_status.add_argument(
         "--i2c-addr",
