@@ -391,6 +391,70 @@ def _sway_output_current_mode(outputs: list[dict[str, Any]], output: str) -> tup
     return None
 
 
+def _sway_output_rect(outputs: list[dict[str, Any]], output: str) -> tuple[int, int, int, int] | None:
+    for o in outputs:
+        if str(o.get("name") or "") != output:
+            continue
+        rect = o.get("rect")
+        if not isinstance(rect, dict):
+            return None
+        x = rect.get("x")
+        y = rect.get("y")
+        w = rect.get("width")
+        h = rect.get("height")
+        if all(isinstance(v, int) for v in (x, y, w, h)):
+            return (int(x), int(y), int(w), int(h))
+        return None
+    return None
+
+
+def _sway_output_scale(outputs: list[dict[str, Any]], output: str) -> float | None:
+    for o in outputs:
+        if str(o.get("name") or "") != output:
+            continue
+        s = o.get("scale")
+        if isinstance(s, (int, float)) and float(s) > 0:
+            return float(s)
+        return None
+    return None
+
+
+def _sway_expected_rect_size(
+    outputs: list[dict[str, Any]],
+    *,
+    output: str,
+    desired: str,
+    active_size: int,
+) -> tuple[int, int] | None:
+    """
+    Predict the expected logical output size (rect width/height) under sway_crop.
+
+    The X1 Fold crop patches are based on an "active height" concept. When the
+    output is rotated (90/270), the logical width/height are swapped.
+    """
+
+    mode = _sway_output_current_mode(outputs, output)
+    transform = _sway_output_transform(outputs, output) or "unknown"
+    scale = _sway_output_scale(outputs, output)
+    if not mode or not scale:
+        return None
+
+    physical_w, physical_h = mode
+    if desired == "half":
+        physical_h = int(active_size)
+
+    logical_w = int(round(float(physical_w) / float(scale)))
+    logical_h = int(round(float(physical_h) / float(scale)))
+
+    rotated = {"90", "270", "flipped-90", "flipped-270"}
+    if transform in rotated:
+        logical_w, logical_h = logical_h, logical_w
+
+    if logical_w <= 0 or logical_h <= 0:
+        return None
+    return (logical_w, logical_h)
+
+
 def _fmt_frac(v: float) -> str:
     s = f"{float(v):.6f}".rstrip("0").rstrip(".")
     return s or "0"
@@ -1118,6 +1182,32 @@ def main(argv: list[str]) -> int:
                 sway_sock,
             )
             same_key = key == last_key
+
+            # Even when the dock-mode state file doesn't change, compositor
+            # events like output hotplug or VT switch/resume can reset custom
+            # output state. Ensure our crop is still actually applied before
+            # we short-circuit on same_key.
+            if same_key and halfblank_method == "sway_crop" and outputs and sway_output:
+                rect = _sway_output_rect(outputs, sway_output)
+                expected = _sway_expected_rect_size(
+                    outputs,
+                    output=sway_output,
+                    desired=desired,
+                    active_size=int(args.active_size),
+                )
+                if rect and expected:
+                    _, _, actual_w, actual_h = rect
+                    expected_w, expected_h = expected
+                    if abs(int(actual_w) - int(expected_w)) > 1 or abs(int(actual_h) - int(expected_h)) > 1:
+                        _log(
+                            "sway_crop_rect_mismatch",
+                            desired=desired,
+                            output=sway_output,
+                            transform=sway_transform,
+                            actual_rect={"x": rect[0], "y": rect[1], "width": actual_w, "height": actual_h},
+                            expected_rect={"width": expected_w, "height": expected_h},
+                        )
+                        same_key = False
             if halfblank_method == "layer_shell":
                 if same_key and desired == "half" and not wl_blanker_running:
                     same_key = False
