@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+# Reset the Wacom I2C HID device on resume.
+# (Touch/pen can get stuck after fold/unfold if it triggers s2idle.)
+#
+# Note: start with *post-only* (resume) to keep this minimally invasive.
+# If the -121 spam persists or the device wedges harder, we can switch to:
+#   pre:  unbind
+#   post: bind
+# so the device is guaranteed to re-probe cleanly across suspend.
+
+case "${1:-}" in
+  post)
+    /usr/local/bin/x1fold-wacom-reset >/dev/null || true
+    ;;
+esac

@@ -59,6 +59,14 @@ if [[ -f "$x1fold_root/scripts/x1fold-halfblank-ui-session.sh" ]]; then
   install -Dm0755 "$x1fold_root/scripts/x1fold-halfblank-ui-session.sh" /usr/local/bin/x1fold-halfblank-ui-session
 fi
 
+if [[ -f "$x1fold_root/scripts/x1fold-wacom-reset.sh" ]]; then
+  install -Dm0755 "$x1fold_root/scripts/x1fold-wacom-reset.sh" /usr/local/bin/x1fold-wacom-reset
+fi
+
+if [[ -f "$x1fold_root/systemd/system-sleep/51-x1fold-wacom-reset" ]]; then
+  install -Dm0755 "$x1fold_root/systemd/system-sleep/51-x1fold-wacom-reset" /usr/lib/systemd/system-sleep/51-x1fold-wacom-reset
+fi
+
 if [[ -f "$x1fold_root/tools/x1fold_x11_blank.c" ]]; then
   if command -v cc >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1 && pkg-config --exists x11 xfixes; then
     tmp_bin="$(mktemp -t x1fold_x11_blank.XXXXXX)"
