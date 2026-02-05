@@ -795,11 +795,24 @@ def _digitizer_mode(state: dict[str, Any]) -> str | None:
     v = state.get("digitizer_observed")
     if isinstance(v, str) and v in {"half", "full"}:
         return v
+
     status = state.get("status")
     if isinstance(status, dict):
+        i2c = status.get("i2c_query")
+        if isinstance(i2c, dict):
+            mode = i2c.get("mode")
+            if isinstance(mode, str) and mode in {"half", "full"}:
+                return mode
         mode = status.get("mode")
         if isinstance(mode, str) and mode in {"half", "full"}:
             return mode
+
+    # If observation fails (I2C timeouts, etc.), fall back to the daemon's
+    # expected policy so we don't flap touch/pen mapping.
+    exp = state.get("digitizer_expected")
+    if isinstance(exp, str) and exp in {"half", "full"}:
+        return exp
+
     return None
 
 

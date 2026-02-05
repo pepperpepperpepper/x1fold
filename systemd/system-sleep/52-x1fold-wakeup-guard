@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+# Prevent lid-closed motion (accelerometer/Intel HID) from waking the system.
+# See: /usr/local/bin/x1fold-wakeup-guard
+
+case "${1:-}" in
+  pre)
+    /usr/local/bin/x1fold-wakeup-guard pre >/dev/null 2>&1 || true
+    ;;
+  post)
+    /usr/local/bin/x1fold-wakeup-guard post >/dev/null 2>&1 || true
+    ;;
+esac
+

@@ -555,9 +555,22 @@ def cmd_status(args: argparse.Namespace) -> int:
             status["i2c_query"]["error"] = f"{type(exc).__name__}: {exc}"
 
     if not status.get("mode") and status.get("devices"):
-        modes = {d.get("mode") for d in status["devices"] if isinstance(d, dict) and d.get("mode")}
+        # Ignore "unknown" when summarizing mode; it's not actionable for policy.
+        modes: set[str] = set()
+        for d in status["devices"]:
+            if not isinstance(d, dict):
+                continue
+            mode = d.get("mode")
+            if isinstance(mode, str) and mode in ("half", "full"):
+                modes.add(mode)
         if len(modes) == 1:
             status["mode"] = next(iter(modes))
+            status["mode_source"] = "hidraw"
+        elif "half" in modes:
+            status["mode"] = "half"
+            status["mode_source"] = "hidraw"
+        elif "full" in modes:
+            status["mode"] = "full"
             status["mode_source"] = "hidraw"
 
     print(json.dumps(status, indent=2, sort_keys=True))

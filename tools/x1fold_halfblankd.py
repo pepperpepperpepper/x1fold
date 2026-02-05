@@ -115,8 +115,13 @@ def _log(event: str, **extra: object) -> None:
 
 def _status_mode(status: dict) -> str | None:
     top = status.get("mode")
-    if isinstance(top, str) and top:
+    if isinstance(top, str) and top in {"half", "full"}:
         return top
+    i2c = status.get("i2c_query")
+    if isinstance(i2c, dict):
+        m = i2c.get("mode")
+        if isinstance(m, str) and m in {"half", "full"}:
+            return m
     devices = status.get("devices")
     if not isinstance(devices, list) or not devices:
         return None
@@ -125,7 +130,7 @@ def _status_mode(status: dict) -> str | None:
         if not isinstance(dev, dict):
             continue
         mode = dev.get("mode")
-        if isinstance(mode, str) and mode:
+        if isinstance(mode, str) and mode in {"half", "full"}:
             modes.add(mode)
     if len(modes) == 1:
         return next(iter(modes))

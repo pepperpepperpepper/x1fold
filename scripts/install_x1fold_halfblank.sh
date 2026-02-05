@@ -63,8 +63,16 @@ if [[ -f "$x1fold_root/scripts/x1fold-wacom-reset.sh" ]]; then
   install -Dm0755 "$x1fold_root/scripts/x1fold-wacom-reset.sh" /usr/local/bin/x1fold-wacom-reset
 fi
 
+if [[ -f "$x1fold_root/scripts/x1fold-wakeup-guard.sh" ]]; then
+  install -Dm0755 "$x1fold_root/scripts/x1fold-wakeup-guard.sh" /usr/local/bin/x1fold-wakeup-guard
+fi
+
 if [[ -f "$x1fold_root/systemd/system-sleep/51-x1fold-wacom-reset" ]]; then
   install -Dm0755 "$x1fold_root/systemd/system-sleep/51-x1fold-wacom-reset" /usr/lib/systemd/system-sleep/51-x1fold-wacom-reset
+fi
+
+if [[ -f "$x1fold_root/systemd/system-sleep/52-x1fold-wakeup-guard" ]]; then
+  install -Dm0755 "$x1fold_root/systemd/system-sleep/52-x1fold-wakeup-guard" /usr/lib/systemd/system-sleep/52-x1fold-wakeup-guard
 fi
 
 if [[ -f "$x1fold_root/tools/x1fold_x11_blank.c" ]]; then
