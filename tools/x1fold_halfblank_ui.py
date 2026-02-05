@@ -784,6 +784,25 @@ def _desired_mode(state: dict[str, Any]) -> str | None:
     return None
 
 
+def _digitizer_mode(state: dict[str, Any]) -> str | None:
+    """
+    Best-effort digitizer mode hint from the root halfblank daemon.
+
+    Newer x1fold_halfblankd.py writes `digitizer_observed` (and usually a parsed
+    `status` object). Older installs won't include either.
+    """
+
+    v = state.get("digitizer_observed")
+    if isinstance(v, str) and v in {"half", "full"}:
+        return v
+    status = state.get("status")
+    if isinstance(status, dict):
+        mode = status.get("mode")
+        if isinstance(mode, str) and mode in {"half", "full"}:
+            return mode
+    return None
+
+
 def _apply_x11(
     desired: str,
     *,
@@ -994,6 +1013,7 @@ def main(argv: list[str]) -> int:
     while True:
         st = _read_state(args.state_file)
         desired = _desired_mode(st) if st else "full"
+        digitizer_mode = _digitizer_mode(st) if st else None
         docked: int | None = None
         if st and isinstance(st.get("dock"), dict):
             d = st.get("dock") or {}
@@ -1250,68 +1270,98 @@ def main(argv: list[str]) -> int:
                         # to the full visible output to avoid a coordinate
                         # mismatch.
                         if sway_sock and desired == "half":
-                            mode = _sway_output_current_mode(outputs, sway_output) if outputs else None
-                            if mode:
-                                _, full_h = mode
-                                top_margin = max(0, int(args.sway_touch_top_margin_px or 0))
-                                bottom_margin = max(0, int(args.sway_touch_bottom_margin_px or 0))
-                                y1_px = top_margin
-                                y2_px = int(args.active_size) - bottom_margin
-                                if y2_px <= y1_px:
+                            # If the digitizer is already in "half" mode (via
+                            # x1fold_mode.py), its coordinate range should match
+                            # the cropped output and we should *not* apply an
+                            # additional map_from_region scaling.
+                            if digitizer_mode == "half":
+                                tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(
+                                    sway_sock,
+                                    p1="0x0",
+                                    p2="1x1",
+                                )
+                                if tm_ok:
                                     _log(
-                                        "sway_touch_map_from_region_failed",
+                                        "sway_touch_map_identity_applied",
                                         desired=desired,
                                         output=sway_output,
-                                        active_size=int(args.active_size),
-                                        top_margin_px=int(top_margin),
-                                        bottom_margin_px=int(bottom_margin),
-                                        full_h=int(full_h),
-                                        error="invalid sway touch margins: active_size must be > top+bottom",
+                                        digitizer_mode=digitizer_mode,
                                     )
                                 else:
-                                    y1 = float(y1_px) / float(full_h)
-                                    y2 = float(y2_px) / float(full_h)
-                                    y1 = max(0.0, min(1.0, y1))
-                                    y2 = max(0.0, min(1.0, y2))
-                                    p1, p2 = f"0x{_fmt_frac(y1)}", f"1x{_fmt_frac(y2)}"
-                                    tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(
-                                        sway_sock,
-                                        p1=p1,
-                                        p2=p2,
+                                    _log(
+                                        "sway_touch_map_identity_failed",
+                                        desired=desired,
+                                        output=sway_output,
+                                        digitizer_mode=digitizer_mode,
+                                        error=tm_err,
                                     )
-                                    if tm_ok:
-                                        _log(
-                                            "sway_touch_map_from_region_applied",
-                                            desired=desired,
-                                            output=sway_output,
-                                            p1=p1,
-                                            p2=p2,
-                                            active_size=int(args.active_size),
-                                            top_margin_px=int(top_margin),
-                                            bottom_margin_px=int(bottom_margin),
-                                            full_h=int(full_h),
-                                        )
-                                    else:
+                            else:
+                                mode = _sway_output_current_mode(outputs, sway_output) if outputs else None
+                                if mode:
+                                    _, full_h = mode
+                                    top_margin = max(0, int(args.sway_touch_top_margin_px or 0))
+                                    bottom_margin = max(0, int(args.sway_touch_bottom_margin_px or 0))
+                                    y1_px = top_margin
+                                    y2_px = int(args.active_size) - bottom_margin
+                                    if y2_px <= y1_px:
                                         _log(
                                             "sway_touch_map_from_region_failed",
                                             desired=desired,
                                             output=sway_output,
-                                            p1=p1,
-                                            p2=p2,
+                                            digitizer_mode=digitizer_mode,
                                             active_size=int(args.active_size),
                                             top_margin_px=int(top_margin),
                                             bottom_margin_px=int(bottom_margin),
                                             full_h=int(full_h),
-                                            error=tm_err,
+                                            error="invalid sway touch margins: active_size must be > top+bottom",
                                         )
-                            else:
-                                _log(
-                                    "sway_touch_map_from_region_failed",
-                                    desired=desired,
-                                    output=sway_output,
-                                    active_size=int(args.active_size),
-                                    error="failed to read sway output current_mode",
-                                )
+                                    else:
+                                        y1 = float(y1_px) / float(full_h)
+                                        y2 = float(y2_px) / float(full_h)
+                                        y1 = max(0.0, min(1.0, y1))
+                                        y2 = max(0.0, min(1.0, y2))
+                                        p1, p2 = f"0x{_fmt_frac(y1)}", f"1x{_fmt_frac(y2)}"
+                                        tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(
+                                            sway_sock,
+                                            p1=p1,
+                                            p2=p2,
+                                        )
+                                        if tm_ok:
+                                            _log(
+                                                "sway_touch_map_from_region_applied",
+                                                desired=desired,
+                                                output=sway_output,
+                                                digitizer_mode=digitizer_mode,
+                                                p1=p1,
+                                                p2=p2,
+                                                active_size=int(args.active_size),
+                                                top_margin_px=int(top_margin),
+                                                bottom_margin_px=int(bottom_margin),
+                                                full_h=int(full_h),
+                                            )
+                                        else:
+                                            _log(
+                                                "sway_touch_map_from_region_failed",
+                                                desired=desired,
+                                                output=sway_output,
+                                                digitizer_mode=digitizer_mode,
+                                                p1=p1,
+                                                p2=p2,
+                                                active_size=int(args.active_size),
+                                                top_margin_px=int(top_margin),
+                                                bottom_margin_px=int(bottom_margin),
+                                                full_h=int(full_h),
+                                                error=tm_err,
+                                            )
+                                else:
+                                    _log(
+                                        "sway_touch_map_from_region_failed",
+                                        desired=desired,
+                                        output=sway_output,
+                                        digitizer_mode=digitizer_mode,
+                                        active_size=int(args.active_size),
+                                        error="failed to read sway output current_mode",
+                                    )
                         elif sway_sock:
                             tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(sway_sock, p1="0x0", p2="1x1")
                             if not tm_ok:

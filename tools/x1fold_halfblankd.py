@@ -486,7 +486,19 @@ def main(argv: list[str]) -> int:
                         dry_run=args.dry_run,
                         timeout_s=args.cmd_timeout_s,
                     )
-                _log("apply_initial", docked=state.docked, modeid=state.modeid, desired=desired, rc=rc)
+                expected_digitizer_mode = _digitizer_mode_for_desired(desired)
+                status, status_err = run_status(cmds.status, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
+                current = _status_mode(status) if status else None
+                _log(
+                    "apply_initial",
+                    docked=state.docked,
+                    modeid=state.modeid,
+                    desired=desired,
+                    digitizer_expected=expected_digitizer_mode,
+                    digitizer_observed=current,
+                    status_error=status_err,
+                    rc=rc,
+                )
                 _write_json_atomic(
                     args.state_file,
                     {
@@ -495,6 +507,10 @@ def main(argv: list[str]) -> int:
                         "dmi": dmi,
                         "dock": state.__dict__,
                         "desired": desired,
+                        "digitizer_expected": expected_digitizer_mode,
+                        "digitizer_observed": current,
+                        "status": status,
+                        "status_error": status_err,
                         "apply_rc": rc,
                         "tty_rc": rc_tty,
                     },
@@ -651,12 +667,18 @@ def main(argv: list[str]) -> int:
         rc_tty = None
         if args.tty_clip:
             rc_tty = run_cmd(_tty_cmd(desired, clear=(desired == "half")), dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
+        expected_digitizer_mode = _digitizer_mode_for_desired(desired)
+        status, status_err = run_status(cmds.status, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
+        current = _status_mode(status) if status else None
         _log(
             "dock_change",
             from_docked=last.docked,
             to_docked=state.docked,
             modeid=state.modeid,
             desired=desired,
+            digitizer_expected=expected_digitizer_mode,
+            digitizer_observed=current,
+            status_error=status_err,
             rc=rc,
             tty_rc=rc_tty,
         )
@@ -670,6 +692,10 @@ def main(argv: list[str]) -> int:
                 "from_docked": last.docked,
                 "to_docked": state.docked,
                 "desired": desired,
+                "digitizer_expected": expected_digitizer_mode,
+                "digitizer_observed": current,
+                "status": status,
+                "status_error": status_err,
                 "apply_rc": rc,
                 "tty_rc": rc_tty,
             },
