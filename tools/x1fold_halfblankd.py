@@ -571,6 +571,9 @@ def main(argv: list[str]) -> int:
                         },
                     )
                 elif current != expected_digitizer_mode:
+                    status_before = status
+                    status_error_before = err
+                    observed_before = current
                     rc = run_cmd(
                         cmds.half if state.docked else cmds.full,
                         dry_run=args.dry_run,
@@ -583,13 +586,27 @@ def main(argv: list[str]) -> int:
                             dry_run=args.dry_run,
                             timeout_s=args.cmd_timeout_s,
                         )
+
+                    # Re-check status after applying so UI helpers don't act on
+                    # stale "before" state (e.g., touch mapping under sway_crop).
+                    status_after, status_error_after = run_status(
+                        cmds.status, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s
+                    )
+                    observed_after = _status_mode(status_after) if status_after else None
+
+                    observed = observed_after or observed_before
+                    status_write = status_after if status_after else status_before
+                    status_error_write = status_error_after if status_error_after is not None else status_error_before
+
                     _log(
                         "enforce_apply",
                         docked=state.docked,
                         modeid=state.modeid,
                         desired=desired,
                         digitizer_expected=expected_digitizer_mode,
-                        digitizer_observed=current,
+                        digitizer_observed=observed,
+                        digitizer_observed_before=observed_before,
+                        digitizer_observed_after=observed_after,
                         rc=rc,
                         tty_rc=rc_tty,
                         since_last_apply_s=round(now - last_apply_ts, 3),
@@ -603,10 +620,15 @@ def main(argv: list[str]) -> int:
                             "dock": state.__dict__,
                             "desired": desired,
                             "digitizer_expected": expected_digitizer_mode,
-                            "digitizer_observed": current,
+                            "digitizer_observed": observed,
                             "apply_rc": rc,
                             "tty_rc": rc_tty,
-                            "status": status,
+                            "status": status_write,
+                            "status_error": status_error_write,
+                            "status_before": status_before,
+                            "status_after": status_after,
+                            "status_error_before": status_error_before,
+                            "status_error_after": status_error_after,
                         },
                     )
                     last_apply_ts = now
