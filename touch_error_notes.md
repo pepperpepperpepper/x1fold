@@ -67,7 +67,8 @@ Symptom:
 What we found:
 
 - Under Sway crop, wlroots still exposes the Wacom touch/pen with a **full-height ABS range** (the HID descriptor does not change), even when the x1fold “digitizer half” latch is enabled.
-- That means: while the output is cropped to `active_size` (top-only), we still need `map_from_region` scaling so touches don’t land “too high”.
+- That means: while the output is cropped to `active_size` (top-only), we need a **libinput `calibration_matrix`** to scale Y so touches don’t land “too high”.
+  - (`map_from_region` only *filters* touches outside a region; it doesn’t scale/remap coordinates.)
 
 Quick recovery:
 
@@ -79,6 +80,11 @@ systemctl --user restart x1fold-halfblank-ui.service
 If you need a one-off manual fix (default `active_size=1240` on a `2560`-tall panel):
 
 ```bash
+# Scale Y by (full_h / active_size) = (2560 / 1240) = 2.064516...
+swaymsg input 1386:21178:Wacom_HID_52BA_Finger calibration_matrix 1 0 0 0 2.064516129 0
+swaymsg input 1386:21178:Wacom_HID_52BA_Pen calibration_matrix 1 0 0 0 2.064516129 0
+
+# Optional: ignore touches outside the active top region (active_size / full_h = 0.484375)
 swaymsg input 1386:21178:Wacom_HID_52BA_Finger map_from_region 0x0 1x0.484375
 swaymsg input 1386:21178:Wacom_HID_52BA_Pen map_from_region 0x0 1x0.484375
 ```
