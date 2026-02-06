@@ -66,16 +66,21 @@ Symptom:
 
 What we found:
 
-- `x1fold_halfblank_ui.py` chooses between:
-  - `map_from_region` (needed when the digitizer reports **full-range** coords while the output is cropped), and
-  - identity mapping (needed when the digitizer is truly in **half** mode and its coords already match the cropped output).
-- If `/run/x1fold-halfblank/state.json` is stale or wrong about `digitizer_observed` / `status.i2c_query.mode`, the UI helper can apply the wrong mapping and touch will feel offset.
+- Under Sway crop, wlroots still exposes the Wacom touch/pen with a **full-height ABS range** (the HID descriptor does not change), even when the x1fold “digitizer half” latch is enabled.
+- That means: while the output is cropped to `active_size` (top-only), we still need `map_from_region` scaling so touches don’t land “too high”.
 
 Quick recovery:
 
 ```bash
 sudo systemctl restart x1fold-halfblankd.service
 systemctl --user restart x1fold-halfblank-ui.service
+```
+
+If you need a one-off manual fix (default `active_size=1240` on a `2560`-tall panel):
+
+```bash
+swaymsg input 1386:21178:Wacom_HID_52BA_Finger map_from_region 0x0 1x0.484375
+swaymsg input 1386:21178:Wacom_HID_52BA_Pen map_from_region 0x0 1x0.484375
 ```
 
 Sanity check (expected to match dock policy):
