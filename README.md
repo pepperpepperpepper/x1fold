@@ -37,6 +37,7 @@ This mirrors how the platform behaves under Windows: the “halfblank” effect 
   - `drm_clip.c`: DRM plane-clip helper (console-safe path; requires DRM master).
 - `scripts/`
   - `install_x1fold_halfblank.sh`: installs binaries + systemd units.
+  - `install_x1fold_webcam.sh`: installs webcam helpers + optional OVTI5675 `ipu_bridge` DKMS override.
   - `x1fold-halfblank-ui-session.sh`: wrapper to run the UI helper inside the active Wayland session (exports `WAYLAND_DISPLAY`/`SWAYSOCK`).
   - `halfblank_switch.sh`: wrapper for `half|full|status`.
   - `halfblank_regression.sh`: on-device loop test with logs.
@@ -64,6 +65,16 @@ Enable the per-user UI helper (run as the desktop user):
 ```bash
 systemctl --user enable --now x1fold-halfblank-ui.service
 ```
+
+### Webcam install (IPU6 / OVTI5675)
+
+Run as root:
+
+```bash
+x1fold/scripts/install_x1fold_webcam.sh
+```
+
+Details and troubleshooting are documented in `x1fold/webcam/README.md`.
 
 ### Wayland “true shorter output” (optional, recommended for wlroots/Sway)
 

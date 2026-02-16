@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  exec sudo -- "$0" "$@"
+fi
+
+# Best-effort: unload the capture/stream pieces.
+# Keep `intel_ipu6`, `ipu_bridge`, and `mei_vsc` loaded once they've been used;
+# unloading them can leave the kernel in a bad state on some setups.
+
+rmmod -v intel_ipu6_isys 2>/dev/null || true
+rmmod -v intel_ipu6_psys 2>/dev/null || true
+
+rmmod -v ov5675 2>/dev/null || true
+rmmod -v ivsc_csi 2>/dev/null || true
+rmmod -v ivsc_ace 2>/dev/null || true
+
+vsc_power_ctl="/sys/devices/platform/intel_vsc/power/control"
+if [[ -w "$vsc_power_ctl" ]]; then
+  echo auto >"$vsc_power_ctl" || true
+fi
+
+echo "IPU6 webcam stack disabled (core helpers kept loaded)."
+echo "Tip: for a full unload/reset, reboot."

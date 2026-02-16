@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  exec sudo -- "$0" "$@"
+fi
+
+# Best-effort: load the full internal camera stack for the X1 Fold 16.
+# This laptop uses Intel IPU6 + IVSC (VSC) with an OVTI5675 sensor.
+
+vsc_power_ctl="/sys/devices/platform/intel_vsc/power/control"
+if [[ -w "$vsc_power_ctl" ]]; then
+  echo on >"$vsc_power_ctl" || true
+fi
+
+modprobe -v mei_vsc || true
+modprobe -v intel_skl_int3472_discrete || true
+
+# The IPU sensors bridge provides the firmware graph (fwnode) needed by IVSC CSI.
+modprobe -v ipu_bridge || true
+
+# IVSC CSI bridge + ACE ownership helper.
+modprobe -v ivsc_csi || true
+modprobe -v ivsc_ace || true
+
+# Sensor + IPU capture blocks.
+modprobe -v ov5675 || true
+modprobe -v intel_ipu6 || true
+modprobe -v intel_ipu6_isys || true
+modprobe -v intel_ipu6_psys || true
+
+echo "IPU6 webcam stack requested."
+echo "Tip: list cameras with: cam --list"
+echo "Tip: capture one frame with: cam --camera 1 --capture=1 --file=/tmp/webcam-#.ppm"
+echo "Tip: check v4l2 nodes with: v4l2-ctl --list-devices"

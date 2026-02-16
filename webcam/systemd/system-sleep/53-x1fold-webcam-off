@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+# Disable the webcam stack before suspend/hibernate to avoid IPU6 weirdness on resume.
+# See: /usr/local/bin/x1fold-webcam-off
+
+case "${1:-}" in
+  pre)
+    /usr/local/bin/x1fold-webcam-off >/dev/null 2>&1 || true
+    ;;
+esac
+
