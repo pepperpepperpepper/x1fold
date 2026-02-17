@@ -5,6 +5,7 @@ This ThinkPad is **not** a USB/UVC webcam. The internal camera is an **Intel IPU
 On Arch Linux (kernel `6.18.x` tested), the missing piece was `ipu_bridge` not advertising `OVTI5675` (and its CSI-2 link frequency) to the media graph. This directory contains:
 
 - Install + enable/disable scripts (`x1fold-webcam-on`, `x1fold-webcam-off`)
+- Chrome bridge scripts (`x1fold-webcam-chrome-on`, `x1fold-webcam-chrome-off`)
 - A DKMS helper that builds an `ipu-bridge` override with `OVTI5675` enabled
 - A modprobe policy file to keep the camera stack off-by-default
 
@@ -42,6 +43,8 @@ That installs:
 
 - `/usr/local/bin/x1fold-webcam-on`
 - `/usr/local/bin/x1fold-webcam-off`
+- `/usr/local/bin/x1fold-webcam-chrome-on`
+- `/usr/local/bin/x1fold-webcam-chrome-off`
 - `/etc/modprobe.d/99-x1fold-disable-ipu6.conf`
 - `/usr/lib/systemd/system-sleep/53-x1fold-webcam-off`
 - DKMS override module: `ipu-bridge-ovti5675` (builds `ipu-bridge.ko`)
@@ -50,13 +53,14 @@ Reboot after installing the DKMS module so the new `ipu_bridge` is used cleanly.
 
 ## Use
 
-Enable the camera stack:
+Enable the camera stack (bridge on by default for Chrome):
 
 ```bash
 sudo x1fold-webcam-on
 ```
 
 `x1fold-webcam-on` also forces the Intel VSC device to stay awake while the camera is enabled (`/sys/devices/platform/intel_vsc/power/control=on`). `x1fold-webcam-off` returns it to `auto`.
+It also starts a V4L2 bridge (`/dev/video42`, label `libcamera`) for Chrome unless you pass `--no-bridge`.
 
 List cameras:
 
@@ -79,6 +83,26 @@ sudo x1fold-webcam-off
 Note: unloading `intel_ipu6` is not reliable on this platform; `x1fold-webcam-off` intentionally avoids removing the core helper modules once they’ve been used. For a full reset back to “off by default”, reboot.
 
 If `x1fold-webcam-on` shows `Device or resource busy` for `intel_ipu6_isys`/`intel_ipu6_psys`, or `cam --list` still shows no cameras, reboot and try again (the IPU6 stack does not always recover cleanly after partial unloads).
+
+## Chrome (V4L2 bridge)
+
+Chrome expects a V4L2 `/dev/video*` device. The bridge is now started by default with `x1fold-webcam-on`.
+To disable it:
+
+```bash
+sudo x1fold-webcam-on --no-bridge
+```
+
+Defaults for the bridge:
+- device: `/dev/video42`
+- label: `libcamera`
+- size: `2584x1944@30fps`
+
+Override via env vars:
+
+```bash
+DEVICE_NUM=42 WIDTH=2584 HEIGHT=1944 FPS=30 LABEL=libcamera sudo x1fold-webcam-on
+```
 
 ## Expected kernel signals (sanity check)
 

@@ -55,6 +55,8 @@ x1fold_root="$repo_root"
 
 install -Dm0755 "$x1fold_root/webcam/bin/x1fold-webcam-on" /usr/local/bin/x1fold-webcam-on
 install -Dm0755 "$x1fold_root/webcam/bin/x1fold-webcam-off" /usr/local/bin/x1fold-webcam-off
+install -Dm0755 "$x1fold_root/webcam/bin/x1fold-webcam-chrome-on" /usr/local/bin/x1fold-webcam-chrome-on
+install -Dm0755 "$x1fold_root/webcam/bin/x1fold-webcam-chrome-off" /usr/local/bin/x1fold-webcam-chrome-off
 install -Dm0644 "$x1fold_root/webcam/modprobe.d/99-x1fold-disable-ipu6.conf" /etc/modprobe.d/99-x1fold-disable-ipu6.conf
 install -Dm0755 "$x1fold_root/webcam/systemd/system-sleep/53-x1fold-webcam-off" /usr/lib/systemd/system-sleep/53-x1fold-webcam-off
 

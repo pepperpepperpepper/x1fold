@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+enable_bridge=1
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: x1fold-webcam-on [--no-bridge]
+
+Enables the IPU6 webcam stack. By default, also starts a V4L2 bridge
+for Chrome via v4l2loopback + GStreamer.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-bridge) enable_bridge=0; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exec sudo -- "$0" "$@"
 fi
@@ -29,7 +48,49 @@ modprobe -v intel_ipu6 || true
 modprobe -v intel_ipu6_isys || true
 modprobe -v intel_ipu6_psys || true
 
+if [[ "$enable_bridge" -eq 1 ]]; then
+  device_num="${DEVICE_NUM:-42}"
+  device="/dev/video${device_num}"
+  width="${WIDTH:-2584}"
+  height="${HEIGHT:-1944}"
+  fps="${FPS:-30}"
+  label="${LABEL:-libcamera}"
+  pid_file="${PID_FILE:-/run/x1fold-webcam-chrome.pid}"
+  log_file="${LOG_FILE:-/tmp/x1fold-webcam-chrome.log}"
+
+  if command -v gst-launch-1.0 >/dev/null 2>&1; then
+    if [[ -f "$pid_file" ]]; then
+      pid="$(cat "$pid_file" 2>/dev/null || true)"
+      if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+        :
+      else
+        rm -f "$pid_file"
+      fi
+    fi
+
+    if [[ ! -f "$pid_file" ]]; then
+      modprobe v4l2loopback video_nr="$device_num" card_label="$label" exclusive_caps=1 || true
+
+      gst-launch-1.0 -v \
+        libcamerasrc \
+        ! "video/x-raw,width=${width},height=${height},framerate=${fps}/1" \
+        ! videoconvert \
+        ! v4l2sink device="$device" sync=false \
+        >"$log_file" 2>&1 &
+
+      echo $! >"$pid_file"
+    fi
+  else
+    echo "warning: gst-launch-1.0 not found; skipping Chrome bridge" >&2
+  fi
+fi
+
 echo "IPU6 webcam stack requested."
 echo "Tip: list cameras with: cam --list"
 echo "Tip: capture one frame with: cam --camera 1 --capture=1 --file=/tmp/webcam-#.ppm"
 echo "Tip: check v4l2 nodes with: v4l2-ctl --list-devices"
+if [[ "$enable_bridge" -eq 1 ]]; then
+  echo "Tip: Chrome bridge on /dev/video${DEVICE_NUM:-42} (label ${LABEL:-libcamera})"
+else
+  echo "Tip: bridge disabled (--no-bridge)"
+fi
