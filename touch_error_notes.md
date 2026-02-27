@@ -46,6 +46,10 @@ Halfblank daemon symptoms:
 sudo x1fold-wacom-reset reset
 ```
 
+If the I²C controller itself wedges (kernel spam like `i2c_designware.1: timeout ...`) and the
+device stays unbound, `x1fold-wacom-reset` now escalates to a **PCI remove+rescan** of the
+parent I²C controller as a last resort.
+
 2. If touch is present but mapping/state seems wrong under Sway, restart the UI helper:
 
 ```bash
