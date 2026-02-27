@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -104,7 +105,7 @@ def _x11_set_rotation(display: str, output: str, rotation: str) -> tuple[bool, s
     return False, msg
 
 
-def _sensorproxy_claim() -> None:
+def _sensorproxy_claim(*, timeout_s: float = 1.0) -> bool:
     try:
         subprocess.run(
             [
@@ -119,12 +120,14 @@ def _sensorproxy_claim() -> None:
             check=False,
             capture_output=True,
             text=True,
+            timeout=float(timeout_s),
         )
-    except OSError:
-        return
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return True
 
 
-def _sensorproxy_orientation() -> str | None:
+def _sensorproxy_orientation(*, timeout_s: float = 1.0) -> str | None:
     """
     Read iio-sensor-proxy's AccelerometerOrientation, e.g. "normal", "left-up".
 
@@ -145,8 +148,9 @@ def _sensorproxy_orientation() -> str | None:
             check=False,
             capture_output=True,
             text=True,
+            timeout=float(timeout_s),
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
         return None
@@ -155,6 +159,27 @@ def _sensorproxy_orientation() -> str | None:
         return None
     s = m.group(1).strip()
     return s or None
+
+
+_MONITOR_SENSOR_ORI_RE = re.compile(r"\b(normal|left-up|right-up|bottom-up)\b", re.IGNORECASE)
+
+
+def _parse_monitor_sensor_orientation(line: str) -> str | None:
+    """
+    Parse an orientation token from `monitor-sensor --accel` output.
+
+    Examples (varies by iio-sensor-proxy version):
+      - "=== Has accelerometer (orientation: normal) ==="
+      - "Accelerometer orientation changed: right-up"
+    """
+
+    s = (line or "").strip()
+    if not s:
+        return None
+    m = _MONITOR_SENSOR_ORI_RE.search(s)
+    if not m:
+        return None
+    return str(m.group(1)).strip().lower() or None
 
 
 class SensorClaim:
@@ -168,7 +193,9 @@ class SensorClaim:
 
     def __init__(self) -> None:
         self.proc: subprocess.Popen[str] | None = None
+        self.thread: threading.Thread | None = None
         self.available: bool | None = None
+        self.last_orientation: str | None = None
 
     def _have_monitor_sensor(self) -> bool:
         if self.available is not None:
@@ -179,17 +206,40 @@ class SensorClaim:
     def running(self) -> bool:
         return bool(self.proc and self.proc.poll() is None)
 
+    def orientation(self) -> str | None:
+        return self.last_orientation
+
+    def _reader(self, proc: subprocess.Popen[str]) -> None:
+        if not proc.stdout:
+            return
+        try:
+            for line in proc.stdout:
+                ori = _parse_monitor_sensor_orientation(line)
+                if ori:
+                    self.last_orientation = ori
+        except Exception:
+            # Best-effort: avoid crashing the parent process due to I/O quirks.
+            return
+
     def start(self) -> bool:
         if self.running():
             return False
         if not self._have_monitor_sensor():
             return False
+        self.last_orientation = None
+        cmd = ["monitor-sensor", "--accel"]
+        # monitor-sensor may become block-buffered when stdout is piped; if
+        # stdbuf is available, force line-buffering so we see orientation
+        # updates with minimal latency and CPU wakeups.
+        if shutil.which("stdbuf"):
+            cmd = ["stdbuf", "-oL", "-eL", *cmd]
         try:
             self.proc = subprocess.Popen(
-                ["monitor-sensor", "--accel"],
+                cmd,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
                 text=True,
             )
         except OSError as exc:
@@ -197,6 +247,8 @@ class SensorClaim:
             self.proc = None
             self.available = False
             return False
+        self.thread = threading.Thread(target=self._reader, args=(self.proc,), daemon=True)
+        self.thread.start()
         return True
 
     def stop(self) -> bool:
@@ -212,6 +264,8 @@ class SensorClaim:
                     self.proc.wait(timeout=1.0)
         finally:
             self.proc = None
+            self.thread = None
+            self.last_orientation = None
         return True
 
 
@@ -1120,7 +1174,6 @@ def main(argv: list[str]) -> int:
         if want_sensor:
             if not sensor_claim_enabled:
                 sensor_claim_enabled = True
-                _sensorproxy_claim()
                 started = sensor_claim.start()
                 _log(
                     "sensor_claim_enabled",
@@ -1167,19 +1220,24 @@ def main(argv: list[str]) -> int:
                     target_transform = "normal"
                     target_transform_reason = "force_normal_when_half"
                 elif sway_sock and sway_output and args.sway_auto_rotate and desired == "full" and (docked in (0, None)):
-                    if (now - last_sensor_check) >= float(args.sway_auto_rotate_interval_s):
+                    ori: str | None = None
+                    if sensor_claim.running():
+                        ori = sensor_claim.orientation()
+                    elif (now - last_sensor_check) >= float(args.sway_auto_rotate_interval_s):
+                        # Fallback for setups without monitor-sensor (polling
+                        # costs power; prefer the monitor-sensor path above).
                         last_sensor_check = now
-                        ori = _sensorproxy_orientation()
-                        if ori:
-                            if ori != last_sensor_orientation:
-                                last_sensor_orientation = ori
-                                stable_s = float(args.sway_auto_rotate_stable_s or 0.0)
-                                if last_sensor_orientation_change == 0.0 and stable_s > 0:
-                                    last_sensor_orientation_change = now - stable_s
-                                else:
-                                    last_sensor_orientation_change = now
-                        target_transform = _sensorproxy_to_sway_transform(ori) if ori else None
-                        target_transform_reason = "sensor"
+                        ori = _sensorproxy_orientation(timeout_s=0.5)
+
+                    if ori and ori != last_sensor_orientation:
+                        last_sensor_orientation = ori
+                        stable_s = float(args.sway_auto_rotate_stable_s or 0.0)
+                        if last_sensor_orientation_change == 0.0 and stable_s > 0:
+                            last_sensor_orientation_change = now - stable_s
+                        else:
+                            last_sensor_orientation_change = now
+                    target_transform = _sensorproxy_to_sway_transform(ori) if ori else None
+                    target_transform_reason = "sensor"
 
                 if (
                     sway_sock
@@ -1643,21 +1701,26 @@ def main(argv: list[str]) -> int:
             target_rot = "normal"
             target_rot_reason = "force_normal_when_half"
         elif args.x11_auto_rotate and desired == "full" and (docked in (0, None)):
-            if (now - last_sensor_check) >= float(args.x11_auto_rotate_interval_s):
+            ori: str | None = None
+            if sensor_claim.running():
+                ori = sensor_claim.orientation()
+            elif (now - last_sensor_check) >= float(args.x11_auto_rotate_interval_s):
+                # Fallback for setups without monitor-sensor (polling costs
+                # power; prefer the monitor-sensor path above).
                 last_sensor_check = now
-                ori = _sensorproxy_orientation()
-                if ori:
-                    if ori != last_sensor_orientation:
-                        last_sensor_orientation = ori
-                        stable_s = float(args.x11_auto_rotate_stable_s or 0.0)
-                        if last_sensor_orientation_change == 0.0 and stable_s > 0:
-                            # Treat the first reading as already stable to avoid
-                            # adding latency at startup unless requested.
-                            last_sensor_orientation_change = now - stable_s
-                        else:
-                            last_sensor_orientation_change = now
-                target_rot = _sensorproxy_to_xrandr_rotation(ori) if ori else None
-                target_rot_reason = "sensor"
+                ori = _sensorproxy_orientation(timeout_s=0.5)
+
+            if ori and ori != last_sensor_orientation:
+                last_sensor_orientation = ori
+                stable_s = float(args.x11_auto_rotate_stable_s or 0.0)
+                if last_sensor_orientation_change == 0.0 and stable_s > 0:
+                    # Treat the first reading as already stable to avoid
+                    # adding latency at startup unless requested.
+                    last_sensor_orientation_change = now - stable_s
+                else:
+                    last_sensor_orientation_change = now
+            target_rot = _sensorproxy_to_xrandr_rotation(ori) if ori else None
+            target_rot_reason = "sensor"
         rotated = False
         if target_rot and target_rot != rotation:
             min_apply_s = float(args.x11_auto_rotate_min_apply_s or 0.0)

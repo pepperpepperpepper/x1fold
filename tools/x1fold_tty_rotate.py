@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -61,7 +62,7 @@ def _desired_mode(state: dict[str, Any]) -> str | None:
     return None
 
 
-def _sensorproxy_claim() -> None:
+def _sensorproxy_claim(*, timeout_s: float = 1.0) -> bool:
     try:
         subprocess.run(
             [
@@ -76,12 +77,14 @@ def _sensorproxy_claim() -> None:
             check=False,
             capture_output=True,
             text=True,
+            timeout=float(timeout_s),
         )
-    except OSError:
-        return
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return True
 
 
-def _sensorproxy_orientation() -> str | None:
+def _sensorproxy_orientation(*, timeout_s: float = 1.0) -> str | None:
     """
     Read iio-sensor-proxy's AccelerometerOrientation, e.g. "normal", "left-up".
 
@@ -102,8 +105,9 @@ def _sensorproxy_orientation() -> str | None:
             check=False,
             capture_output=True,
             text=True,
+            timeout=float(timeout_s),
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
         return None
@@ -112,6 +116,19 @@ def _sensorproxy_orientation() -> str | None:
         return None
     s = m.group(1).strip()
     return s or None
+
+
+_MONITOR_SENSOR_ORI_RE = re.compile(r"\b(normal|left-up|right-up|bottom-up)\b", re.IGNORECASE)
+
+
+def _parse_monitor_sensor_orientation(line: str) -> str | None:
+    s = (line or "").strip()
+    if not s:
+        return None
+    m = _MONITOR_SENSOR_ORI_RE.search(s)
+    if not m:
+        return None
+    return str(m.group(1)).strip().lower() or None
 
 
 class SensorClaim:
@@ -125,7 +142,9 @@ class SensorClaim:
 
     def __init__(self) -> None:
         self.proc: subprocess.Popen[str] | None = None
+        self.thread: threading.Thread | None = None
         self.available: bool | None = None
+        self.last_orientation: str | None = None
 
     def _have_monitor_sensor(self) -> bool:
         if self.available is not None:
@@ -133,40 +152,39 @@ class SensorClaim:
         self.available = bool(shutil.which("monitor-sensor"))
         return bool(self.available)
 
-    def _any_monitor_sensor_running(self) -> bool:
-        if shutil.which("pgrep"):
-            try:
-                proc = subprocess.run(["pgrep", "-x", "monitor-sensor"], check=False, capture_output=True, text=True)
-                if proc.returncode == 0:
-                    return True
-            except OSError:
-                pass
-
-        # Fallback: scan /proc (works on minimal systems without procps-ng).
-        try:
-            for comm in Path("/proc").glob("[0-9]*/comm"):
-                if comm.read_text(encoding="utf-8", errors="replace").strip() == "monitor-sensor":
-                    return True
-        except OSError:
-            return False
-        return False
-
     def running(self) -> bool:
-        if self.proc and self.proc.poll() is None:
-            return True
-        return self._any_monitor_sensor_running()
+        return bool(self.proc and self.proc.poll() is None)
+
+    def orientation(self) -> str | None:
+        return self.last_orientation
+
+    def _reader(self, proc: subprocess.Popen[str]) -> None:
+        if not proc.stdout:
+            return
+        try:
+            for line in proc.stdout:
+                ori = _parse_monitor_sensor_orientation(line)
+                if ori:
+                    self.last_orientation = ori
+        except Exception:
+            return
 
     def start(self) -> bool:
         if self.running():
             return False
         if not self._have_monitor_sensor():
             return False
+        self.last_orientation = None
+        cmd = ["monitor-sensor", "--accel"]
+        if shutil.which("stdbuf"):
+            cmd = ["stdbuf", "-oL", "-eL", *cmd]
         try:
             self.proc = subprocess.Popen(
-                ["monitor-sensor", "--accel"],
+                cmd,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
                 text=True,
             )
         except OSError as exc:
@@ -174,6 +192,8 @@ class SensorClaim:
             self.proc = None
             self.available = False
             return False
+        self.thread = threading.Thread(target=self._reader, args=(self.proc,), daemon=True)
+        self.thread.start()
         return True
 
     def stop(self) -> bool:
@@ -189,6 +209,8 @@ class SensorClaim:
                     self.proc.wait(timeout=1.0)
         finally:
             self.proc = None
+            self.thread = None
+            self.last_orientation = None
         return True
 
 
@@ -325,7 +347,6 @@ def main(argv: list[str]) -> int:
             if want_sensor:
                 if not sensor_claim_enabled:
                     sensor_claim_enabled = True
-                    _sensorproxy_claim()
                     started = sensor_claim.start()
                     _log("sensor_claim_enabled", started=bool(started), running=bool(sensor_claim.running()))
                 elif not sensor_claim.running():
@@ -341,7 +362,10 @@ def main(argv: list[str]) -> int:
                 target = 0
                 reason = "force_normal_when_half"
             elif desired == "full":
-                sensor_orientation = _sensorproxy_orientation()
+                if sensor_claim.running():
+                    sensor_orientation = sensor_claim.orientation()
+                else:
+                    sensor_orientation = _sensorproxy_orientation(timeout_s=0.5)
                 if sensor_orientation:
                     if sensor_orientation != last_sensor_orientation:
                         last_sensor_orientation = sensor_orientation
