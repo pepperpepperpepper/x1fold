@@ -327,9 +327,20 @@ def patch_report(report: bytes, offset: int, patch: bytes) -> bytes:
 
 def report_mode(report: bytes, offset: int) -> str:
     field = report[offset : offset + 6]
-    if field == HALF_BYTES:
+    if len(field) != 6:
+        return "unknown"
+
+    # Historically we treated the full 6-byte field as the "mode marker".
+    # Field notes show the last 2 bytes are the reliable latch:
+    #   00 00 => full
+    #   33 1a => half
+    #
+    # The preceding 4 bytes can vary across time/boots even when the latch is
+    # stable, so avoid strict equality on the whole 6 bytes.
+    tail2 = field[4:6]
+    if tail2 == b"\x33\x1a":
         return "half"
-    if field == FULL_BYTES:
+    if tail2 == b"\x00\x00":
         return "full"
     return "unknown"
 
@@ -611,7 +622,7 @@ def cmd_set(args: argparse.Namespace) -> int:
                 verify = hid_get_feature(dev, args.report_id, args.report_len)
                 row["verify_mode"] = report_mode(verify, args.patch_offset)
                 row["verify_bytes_10_15"] = _hex_bytes(verify[args.patch_offset : args.patch_offset + 6])
-                if verify[args.patch_offset : args.patch_offset + 6] != target:
+                if row.get("verify_mode") != args.mode:
                     failures.append(f"{dev.dev}: verify mismatch (got {row['verify_bytes_10_15']})")
             except OSError as exc:
                 failures.append(f"{dev.dev}: verify failed [{exc.errno}] {exc.strerror}")
@@ -627,10 +638,11 @@ def cmd_set(args: argparse.Namespace) -> int:
             try:
                 before = hid_get_feature(dev, args.report_id, args.report_len)
                 before_bytes = before[args.patch_offset : args.patch_offset + 6]
-                row["before_mode"] = report_mode(before, args.patch_offset)
+                before_mode = report_mode(before, args.patch_offset)
+                row["before_mode"] = before_mode
                 row["before_bytes_10_15"] = _hex_bytes(before_bytes)
 
-                if before_bytes == target:
+                if before_mode == args.mode:
                     row["already"] = True
                 else:
                     after = patch_report(before, args.patch_offset, target)
@@ -658,7 +670,7 @@ def cmd_set(args: argparse.Namespace) -> int:
                 verify = hid_get_feature(dev, args.report_id, args.report_len)
                 row["verify_mode"] = report_mode(verify, args.patch_offset)
                 row["verify_bytes_10_15"] = _hex_bytes(verify[args.patch_offset : args.patch_offset + 6])
-                if verify[args.patch_offset : args.patch_offset + 6] != target:
+                if row.get("verify_mode") != args.mode:
                     failures.append(f"{dev.dev}: verify mismatch (got {row['verify_bytes_10_15']})")
             except OSError as exc:
                 failures.append(f"{dev.dev}: verify failed [{exc.errno}] {exc.strerror}")
