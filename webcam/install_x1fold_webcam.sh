@@ -53,6 +53,9 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 x1fold_root="$repo_root"
 
+# Cleanup: older installs used a different system-sleep hook name.
+rm -f /usr/lib/systemd/system-sleep/50-x1fold-webcam-off
+
 install -Dm0755 "$x1fold_root/webcam/bin/x1fold-webcam-on" /usr/local/bin/x1fold-webcam-on
 install -Dm0755 "$x1fold_root/webcam/bin/x1fold-webcam-off" /usr/local/bin/x1fold-webcam-off
 install -Dm0755 "$x1fold_root/webcam/bin/x1fold-webcam-chrome-on" /usr/local/bin/x1fold-webcam-chrome-on

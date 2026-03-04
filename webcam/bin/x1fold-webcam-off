@@ -5,6 +5,15 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exec sudo -- "$0" "$@"
 fi
 
+run_timeout() {
+  local timeout_s="${X1FOLD_WEBCAM_OFF_TIMEOUT_S:-2}"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${timeout_s}s" "$@" 2>/dev/null || true
+  else
+    "$@" 2>/dev/null || true
+  fi
+}
+
 # Stop Chrome bridge if running.
 pid_file="${PID_FILE:-/run/x1fold-webcam-chrome.pid}"
 if [[ -f "$pid_file" ]]; then
@@ -17,18 +26,18 @@ if [[ -f "$pid_file" ]]; then
   rm -f "$pid_file"
 fi
 
-modprobe -r v4l2loopback 2>/dev/null || true
+run_timeout modprobe -r v4l2loopback
 
 # Best-effort: unload the capture/stream pieces.
 # Keep `intel_ipu6`, `ipu_bridge`, and `mei_vsc` loaded once they've been used;
 # unloading them can leave the kernel in a bad state on some setups.
 
-rmmod -v intel_ipu6_isys 2>/dev/null || true
-rmmod -v intel_ipu6_psys 2>/dev/null || true
+run_timeout rmmod -v intel_ipu6_isys
+run_timeout rmmod -v intel_ipu6_psys
 
-rmmod -v ov5675 2>/dev/null || true
-rmmod -v ivsc_csi 2>/dev/null || true
-rmmod -v ivsc_ace 2>/dev/null || true
+run_timeout rmmod -v ov5675
+run_timeout rmmod -v ivsc_csi
+run_timeout rmmod -v ivsc_ace
 
 vsc_power_ctl="/sys/devices/platform/intel_vsc/power/control"
 if [[ -w "$vsc_power_ctl" ]]; then

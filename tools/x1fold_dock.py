@@ -195,9 +195,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         "ts": utc_iso(),
         "backend": args.backend,
         "acpi_call": str(args.acpi_call),
+        "acpi_call_exists": bool(args.acpi_call.exists()),
         "ec_io": str(args.ec_io),
+        "ec_io_exists": bool(args.ec_io.exists()),
         "ec_offset": f"0x{args.ec_offset:x}",
         "paths": {"dock_sysfs": str(args.dock_sysfs), "gdst": args.gdst, "cmmd": args.cmmd},
+        "dock_sysfs_exists": bool(args.dock_sysfs.exists()),
         "state": state.to_json(),
     }
     print(json.dumps(out, indent=2, sort_keys=True))
@@ -207,6 +210,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_watch(args: argparse.Namespace) -> int:
     last: DockState | None = None
     count = 0
+    last_sample_ts = 0.0
     while True:
         state = read_dock_state(
             backend=args.backend,
@@ -217,16 +221,43 @@ def cmd_watch(args: argparse.Namespace) -> int:
             ec_offset=args.ec_offset,
             dock_sysfs=args.dock_sysfs,
         )
+        now = time.monotonic()
         if last is None and args.print_initial:
-            print(json.dumps({"ts": utc_iso(), "event": "initial", "state": state.to_json()}, sort_keys=True))
+            print(
+                json.dumps(
+                    {
+                        "ts": utc_iso(),
+                        "event": "initial",
+                        "acpi_call_exists": bool(args.acpi_call.exists()),
+                        "ec_io_exists": bool(args.ec_io.exists()),
+                        "dock_sysfs_exists": bool(args.dock_sysfs.exists()),
+                        "state": state.to_json(),
+                    },
+                    sort_keys=True,
+                )
+            )
             last = state
+            last_sample_ts = now
             continue
         if last is not None and state.docked == last.docked and state.modeid == last.modeid:
+            if args.print_every_s and now - last_sample_ts >= args.print_every_s:
+                print(
+                    json.dumps(
+                        {
+                            "ts": utc_iso(),
+                            "event": "sample",
+                            "state": state.to_json(),
+                        },
+                        sort_keys=True,
+                    )
+                )
+                last_sample_ts = now
             time.sleep(args.interval_s)
             continue
         print(json.dumps({"ts": utc_iso(), "event": "change", "state": state.to_json()}, sort_keys=True))
         last = state
         count += 1
+        last_sample_ts = now
         if args.max_events and count >= args.max_events:
             return 0
         time.sleep(args.interval_s)
@@ -275,6 +306,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch = sub.add_parser("watch", help="Poll and print JSON lines on changes.")
     p_watch.add_argument("--interval-s", type=float, default=0.2, help="Polling interval in seconds (default: 0.2).")
     p_watch.add_argument("--print-initial", action="store_true", help="Emit an initial state event immediately.")
+    p_watch.add_argument(
+        "--print-every-s",
+        type=float,
+        default=0.0,
+        help="Also emit periodic sample events even when unchanged (0 disables; default: 0).",
+    )
     p_watch.add_argument("--max-events", type=int, default=0, help="Stop after N change events (0 = infinite).")
     p_watch.set_defaults(fn=cmd_watch)
     return parser

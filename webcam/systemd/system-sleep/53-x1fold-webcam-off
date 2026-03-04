@@ -6,7 +6,13 @@ set -eu
 
 case "${1:-}" in
   pre)
-    /usr/local/bin/x1fold-webcam-off >/dev/null 2>&1 || true
+    # Avoid touching the IPU6/VSC stack on hibernate paths: we've observed cases
+    # where unloading modules right before hibernation entry can hang the system
+    # (screen goes black, but power/heat stays high).
+    case "${2:-}" in
+      suspend)
+        /usr/local/bin/x1fold-webcam-off >/dev/null 2>&1 || true
+        ;;
+    esac
     ;;
 esac
-
