@@ -1,0 +1,102 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    echo "usage: $0 list | set normal|swapped" >&2
+}
+
+need_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        exec sudo "$0" "$@"
+    fi
+}
+
+list_candidates() {
+    found=0
+    for h in /sys/class/hidraw/hidraw*; do
+        [ -e "$h" ] || continue
+        dev=$(readlink -f "$h/device")
+        uevent="$dev/uevent"
+        [ -f "$uevent" ] || continue
+
+        hid_id=$(sed -n 's/^HID_ID=....:000017EF:0000//p' "$uevent" | tr '[:lower:]' '[:upper:]')
+        driver=$(sed -n 's/^DRIVER=//p' "$uevent")
+        name=$(sed -n 's/^HID_NAME=//p' "$uevent")
+
+        case "$hid_id:$driver" in
+            613E:hid-generic|6142:hid-generic)
+                found=1
+                printf '%s vendor=17ef product=%s driver=%s name=%s\n' \
+                    "/dev/$(basename "$h")" "$hid_id" "$driver" "$name"
+                ;;
+        esac
+    done
+
+    [ "$found" -eq 1 ]
+}
+
+send_report() {
+    report_name=$1
+    found=0
+
+    for h in /sys/class/hidraw/hidraw*; do
+        [ -e "$h" ] || continue
+        dev=$(readlink -f "$h/device")
+        uevent="$dev/uevent"
+        [ -f "$uevent" ] || continue
+
+        hid_id=$(sed -n 's/^HID_ID=....:000017EF:0000//p' "$uevent" | tr '[:lower:]' '[:upper:]')
+        driver=$(sed -n 's/^DRIVER=//p' "$uevent")
+
+        case "$hid_id:$driver" in
+            613E:hid-generic|6142:hid-generic)
+                found=1
+                case "$report_name" in
+                    normal)
+                        printf '\011\264\001' > "/dev/$(basename "$h")"
+                        ;;
+                    swapped)
+                        printf '\011\264\002' > "/dev/$(basename "$h")"
+                        ;;
+                    *)
+                        usage
+                        exit 1
+                        ;;
+                esac
+                printf 'sent %s report to %s (17ef:%s)\n' \
+                    "$report_name" "/dev/$(basename "$h")" "$hid_id"
+                ;;
+        esac
+    done
+
+    if [ "$found" -ne 1 ]; then
+        echo "no matching Lenovo keyboard hidraw node found" >&2
+        exit 1
+    fi
+}
+
+case "${1:-}" in
+    list)
+        if ! list_candidates; then
+            echo "no matching Lenovo keyboard hidraw node found" >&2
+            exit 1
+        fi
+        ;;
+    set)
+        [ $# -eq 2 ] || { usage; exit 1; }
+        need_root "$@"
+        case "$2" in
+            normal|swapped)
+                send_report "$2"
+                ;;
+            *)
+                usage
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac
