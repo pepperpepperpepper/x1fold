@@ -1,0 +1,6 @@
+# Reapply the X1 Fold keyboard-side Fn/Ctrl swap whenever the Lenovo
+# keyboard hidraw device appears over Bluetooth (17EF:613E) or USB
+# (17EF:6142). The helper itself decides which matching hidraw nodes to
+# program.
+ACTION=="add|change", SUBSYSTEM=="hidraw", KERNEL=="hidraw*", KERNELS=="0005:17EF:613E.*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="x1fold-fnctl-swapped.service"
+ACTION=="add|change", SUBSYSTEM=="hidraw", KERNEL=="hidraw*", KERNELS=="0003:17EF:6142.*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="x1fold-fnctl-swapped.service"

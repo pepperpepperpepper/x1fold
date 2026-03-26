@@ -1,0 +1,7 @@
+[Unit]
+Description=Reapply X1 Fold keyboard Fn/Ctrl swap
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/x1fold-fnctl set swapped
