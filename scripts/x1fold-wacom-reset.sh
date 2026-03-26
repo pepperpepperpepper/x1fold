@@ -21,18 +21,31 @@ driver="${X1FOLD_WACOM_I2C_DRIVER:-i2c_hid_acpi}"
 sleep_s="${X1FOLD_WACOM_RESET_SLEEP_S:-0.3}"
 bind_wait_ticks="${X1FOLD_WACOM_BIND_WAIT_TICKS:-40}" # 40 * 50ms = 2s
 
-# If a simple i2c_hid_acpi rebind doesn't bring the device back (common when the
-# parent I2C controller wedges and the kernel spams i2c_designware timeouts),
-# we can reset the whole PCI function that hosts the I2C controller.
+# If a simple i2c_hid_acpi rebind doesn't bring the device back, prefer
+# rebinding the i2c_designware platform controller before escalating further.
 #
-# This is intentionally a last resort: it will drop *all* I2C devices hanging
-# off that controller.
-pci_recover="${X1FOLD_WACOM_PCI_RECOVER_ON_FAIL:-1}"
+# This remains opt-in because recent kernels can still mis-handle controller
+# re-enumeration on this platform and leave duplicate software-node state
+# behind. Prefer a plain i2c_hid_acpi rebind by default.
+controller_recover="${X1FOLD_WACOM_CONTROLLER_RECOVER_ON_FAIL:-0}"
+controller_driver="${X1FOLD_WACOM_CONTROLLER_DRIVER:-i2c_designware}"
+
+# PCI remove/rescan remains available as an opt-in last resort, but it is
+# disabled by default because it has been observed to leave the controller in a
+# worse state on newer kernels.
+pci_recover="${X1FOLD_WACOM_PCI_RECOVER_ON_FAIL:-0}"
 pci_bdf_override="${X1FOLD_WACOM_PCI_BDF:-}"
+node_wait_ticks="${X1FOLD_WACOM_NODE_WAIT_TICKS:-60}" # 60 * 50ms = 3s
 
 case "$bind_wait_ticks" in
   ''|*[!0-9]*)
     bind_wait_ticks=40
+    ;;
+esac
+
+case "$node_wait_ticks" in
+  ''|*[!0-9]*)
+    node_wait_ticks=60
     ;;
 esac
 
@@ -68,6 +81,65 @@ wait_for_bind() {
     i=$((i + 1))
     sleep 0.05
   done
+}
+
+wait_for_dev_path() {
+  i=0
+  while [ ! -e "$dev_path" ] && [ "$i" -lt "$bind_wait_ticks" ]; do
+    i=$((i + 1))
+    sleep 0.05
+  done
+}
+
+wait_for_user_nodes() {
+  p="$(readlink -f "$dev_path" 2>/dev/null || true)"
+  [ -n "$p" ] || return 1
+  i=0
+  while [ "$i" -lt "$node_wait_ticks" ]; do
+    if find "$p" -maxdepth 3 \( -name 'hidraw*' -o -name 'event*' \) | grep -q .; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.05
+  done
+  return 1
+}
+
+find_platform_controller() {
+  p="$(readlink -f "$dev_path" 2>/dev/null || true)"
+  [ -n "$p" ] || return 1
+  echo "$p" | awk -F'/' '{for (i=1; i<=NF; i++) if ($i ~ /^i2c_designware(\.[0-9]+)?$/) {print $i; exit}}'
+}
+
+controller_recover_if_needed() {
+  [ "$controller_recover" = "1" ] || return 0
+  [ "$do_bind" -eq 1 ] || return 0
+  if is_bound && wait_for_user_nodes; then
+    return 0
+  fi
+
+  controller="$(find_platform_controller 2>/dev/null || true)"
+  [ -n "$controller" ] || return 0
+
+  controller_path="/sys/bus/platform/devices/${controller}"
+  controller_driver_path="/sys/bus/platform/drivers/${controller_driver}"
+  [ -e "$controller_path" ] || return 0
+  [ -d "$controller_driver_path" ] || return 0
+
+  echo "x1fold-wacom-reset: ${dev} still not ready; rebinding platform controller ${controller}" >&2
+
+  echo "$controller" >"${controller_driver_path}/unbind" 2>/dev/null || true
+  sleep 0.2
+  echo "$controller" >"${controller_driver_path}/bind" 2>/dev/null || true
+
+  wait_for_dev_path
+
+  if [ -e "$dev_path" ] && [ -d "$driver_path" ] && ! is_bound; then
+    echo "$dev" >"${driver_path}/bind" 2>/dev/null || true
+    wait_for_bind
+  fi
+
+  wait_for_user_nodes || true
 }
 
 find_pci_bdf() {
@@ -151,10 +223,13 @@ if [ "$do_bind" -eq 1 ]; then
   fi
 fi
 
+controller_recover_if_needed
 pci_recover_if_needed
 
 if ! is_bound; then
   echo "x1fold-wacom-reset: warning: ${dev} not bound to ${driver} after reset" >&2
+elif ! wait_for_user_nodes; then
+  echo "x1fold-wacom-reset: warning: ${dev} bound but hidraw/input nodes did not appear in time" >&2
 fi
 
 exit 0

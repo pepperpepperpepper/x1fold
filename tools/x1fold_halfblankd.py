@@ -85,11 +85,26 @@ class Commands:
     half: list[str]
     full: list[str]
     status: list[str]
+    recovery: list[str]
 
 
 def _parse_cmd(value: str) -> list[str]:
     # Accept a shell-like string for convenience.
     return shlex.split(value)
+
+
+def _default_recovery_cmd() -> list[str]:
+    for candidate in (
+        Path("/usr/local/bin/x1fold-wacom-reset"),
+        Path("/usr/bin/x1fold-wacom-reset"),
+    ):
+        if candidate.exists():
+            return [str(candidate), "reset"]
+    repo_root = Path(__file__).resolve().parents[1]
+    local = repo_root / "scripts" / "x1fold-wacom-reset.sh"
+    if local.exists():
+        return [str(local), "reset"]
+    return []
 
 
 def run_cmd(cmd: list[str], *, dry_run: bool, timeout_s: float | None) -> int:
@@ -139,6 +154,22 @@ def _status_mode(status: dict) -> str | None:
     if "full" in modes:
         return "full"
     return None
+
+
+def _status_device_errors(status: dict | None) -> list[str]:
+    if not isinstance(status, dict):
+        return []
+    out: list[str] = []
+    devices = status.get("devices")
+    if isinstance(devices, list):
+        for dev in devices:
+            if not isinstance(dev, dict):
+                continue
+            err = dev.get("error")
+            if isinstance(err, str) and err:
+                name = dev.get("dev") if isinstance(dev.get("dev"), str) else "device"
+                out.append(f"{name}: {err}")
+    return out
 
 
 def run_status(cmd: list[str], *, dry_run: bool, timeout_s: float | None) -> tuple[dict | None, str | None]:
@@ -335,6 +366,23 @@ def main(argv: list[str]) -> int:
         default="",
         help="Command to query current mode as JSON (string; default uses halfblank_switch status).",
     )
+    parser.add_argument(
+        "--recovery-cmd",
+        default="",
+        help="Command to run when the digitizer wedges (default: auto-detect x1fold-wacom-reset reset).",
+    )
+    parser.add_argument(
+        "--recovery-cooldown-s",
+        type=float,
+        default=20.0,
+        help="Minimum time between digitizer recovery attempts (seconds; default: 20).",
+    )
+    parser.add_argument(
+        "--error-backoff-s",
+        type=float,
+        default=20.0,
+        help="After digitizer failures, suppress steady-state enforce retries for this many seconds (0 disables; default: 20).",
+    )
     args = parser.parse_args(argv)
 
     dmi = _dmi_info()
@@ -420,6 +468,7 @@ def main(argv: list[str]) -> int:
         half=_parse_cmd(args.half_cmd) if args.half_cmd else _default_tool_cmd("half"),
         full=_parse_cmd(args.full_cmd) if args.full_cmd else _default_tool_cmd("full"),
         status=_parse_cmd(args.status_cmd) if args.status_cmd else _default_status_cmd(),
+        recovery=_parse_cmd(args.recovery_cmd) if args.recovery_cmd else _default_recovery_cmd(),
     )
 
     last: DockState | None = None
@@ -430,6 +479,11 @@ def main(argv: list[str]) -> int:
     enforce_every_s = float(args.enforce_every_s or 0.0)
     last_tty_enforce_ts = 0.0
     tty_enforce_every_s = float(args.tty_enforce_every_s or 0.0)
+    recovery_timeout_s = max(float(args.cmd_timeout_s or 0.0), 15.0)
+    last_recovery_ts = -max(float(args.recovery_cooldown_s or 0.0), 0.0)
+    backoff_until_ts = 0.0
+    digitizer_failure_count = 0
+    last_good_digitizer_mode: str | None = None
 
     # Track the active VT so we can (re)apply tty halfblank when switching
     # between a graphical VT (KD_GRAPHICS; sway) and a text VT (KD_TEXT).
@@ -444,11 +498,108 @@ def main(argv: list[str]) -> int:
         tty_clip=bool(args.tty_clip),
         tty_enforce_every_s=tty_enforce_every_s,
         dry_run=bool(args.dry_run),
-        cmds={"half": cmds.half, "full": cmds.full, "status": cmds.status},
+        cmds={
+            "half": cmds.half,
+            "full": cmds.full,
+            "status": cmds.status,
+            "recovery": cmds.recovery,
+        },
         state_file=str(args.state_file),
         dmi=dmi,
         hostname=os.uname().nodename if hasattr(os, "uname") else None,
     )
+
+    def _observe_status(status: dict | None, status_err: str | None) -> tuple[str | None, list[str], bool]:
+        nonlocal last_good_digitizer_mode
+        observed = _status_mode(status) if status else None
+        device_errors = _status_device_errors(status)
+        healthy = status_err is None and not device_errors and observed in {"half", "full"}
+        if healthy and observed in {"half", "full"}:
+            last_good_digitizer_mode = observed
+        return observed, device_errors, healthy
+
+    def _apply_desired_mode(state: DockState, desired: str, *, tty_clear: bool) -> dict[str, object]:
+        nonlocal last_recovery_ts, backoff_until_ts, digitizer_failure_count
+
+        expected_digitizer_mode = _digitizer_mode_for_desired(desired)
+        cmd = cmds.half if state.docked else cmds.full
+        rc = run_cmd(cmd, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
+        rc_tty = None
+        if args.tty_clip:
+            rc_tty = run_cmd(
+                _tty_cmd(desired, clear=tty_clear),
+                dry_run=args.dry_run,
+                timeout_s=args.cmd_timeout_s,
+            )
+
+        status, status_err = run_status(cmds.status, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
+        observed, device_errors, healthy = _observe_status(status, status_err)
+
+        recovery_attempted = False
+        recovery_rc: int | None = None
+        recovery_reason: str | None = None
+
+        failed = (rc != 0) or (status_err is not None) or bool(device_errors)
+        if failed:
+            digitizer_failure_count += 1
+            recovery_reason = "apply_rc" if rc != 0 else "status_error" if status_err is not None else "device_error"
+            recovery_allowed = bool(cmds.recovery) and (
+                float(args.recovery_cooldown_s) <= 0
+                or (time.monotonic() - last_recovery_ts) >= float(args.recovery_cooldown_s)
+            )
+            if recovery_allowed:
+                recovery_attempted = True
+                last_recovery_ts = time.monotonic()
+                _log(
+                    "digitizer_recovery_start",
+                    docked=state.docked,
+                    modeid=state.modeid,
+                    desired=desired,
+                    digitizer_expected=expected_digitizer_mode,
+                    reason=recovery_reason,
+                    cmd=cmds.recovery,
+                )
+                recovery_rc = run_cmd(cmds.recovery, dry_run=args.dry_run, timeout_s=recovery_timeout_s)
+                _log(
+                    "digitizer_recovery_done",
+                    docked=state.docked,
+                    modeid=state.modeid,
+                    desired=desired,
+                    digitizer_expected=expected_digitizer_mode,
+                    reason=recovery_reason,
+                    rc=recovery_rc,
+                )
+                if recovery_rc == 0:
+                    rc = run_cmd(cmd, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
+                    status, status_err = run_status(cmds.status, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
+                    observed, device_errors, healthy = _observe_status(status, status_err)
+
+            if (rc != 0) or (status_err is not None) or bool(device_errors):
+                if float(args.error_backoff_s) > 0:
+                    backoff_until_ts = max(backoff_until_ts, time.monotonic() + float(args.error_backoff_s))
+            else:
+                digitizer_failure_count = 0
+                backoff_until_ts = 0.0
+        else:
+            digitizer_failure_count = 0
+            backoff_until_ts = 0.0
+
+        return {
+            "apply_rc": rc,
+            "tty_rc": rc_tty,
+            "status": status,
+            "status_error": status_err,
+            "digitizer_expected": expected_digitizer_mode,
+            "digitizer_observed": observed,
+            "digitizer_errors": device_errors,
+            "digitizer_healthy": healthy,
+            "digitizer_last_good": last_good_digitizer_mode,
+            "recovery_attempted": recovery_attempted,
+            "recovery_rc": recovery_rc,
+            "recovery_reason": recovery_reason,
+            "retry_after_s": max(0.0, round(backoff_until_ts - time.monotonic(), 3)),
+            "digitizer_failure_count": digitizer_failure_count,
+        }
 
     while True:
         state = read_dock_state(
@@ -483,26 +634,24 @@ def main(argv: list[str]) -> int:
                         "desired": desired,
                     },
                 )
-                rc = run_cmd(cmds.half if state.docked else cmds.full, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
-                rc_tty = None
-                if args.tty_clip:
-                    rc_tty = run_cmd(
-                        _tty_cmd(desired, clear=(desired == "half")),
-                        dry_run=args.dry_run,
-                        timeout_s=args.cmd_timeout_s,
-                    )
-                expected_digitizer_mode = _digitizer_mode_for_desired(desired)
-                status, status_err = run_status(cmds.status, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
-                current = _status_mode(status) if status else None
+                result = _apply_desired_mode(state, desired, tty_clear=(desired == "half"))
                 _log(
                     "apply_initial",
                     docked=state.docked,
                     modeid=state.modeid,
                     desired=desired,
-                    digitizer_expected=expected_digitizer_mode,
-                    digitizer_observed=current,
-                    status_error=status_err,
-                    rc=rc,
+                    digitizer_expected=result["digitizer_expected"],
+                    digitizer_observed=result["digitizer_observed"],
+                    digitizer_errors=result["digitizer_errors"],
+                    digitizer_healthy=result["digitizer_healthy"],
+                    digitizer_last_good=result["digitizer_last_good"],
+                    digitizer_failure_count=result["digitizer_failure_count"],
+                    status_error=result["status_error"],
+                    recovery_attempted=result["recovery_attempted"],
+                    recovery_rc=result["recovery_rc"],
+                    recovery_reason=result["recovery_reason"],
+                    retry_after_s=result["retry_after_s"],
+                    rc=result["apply_rc"],
                 )
                 _write_json_atomic(
                     args.state_file,
@@ -512,12 +661,20 @@ def main(argv: list[str]) -> int:
                         "dmi": dmi,
                         "dock": state.__dict__,
                         "desired": desired,
-                        "digitizer_expected": expected_digitizer_mode,
-                        "digitizer_observed": current,
-                        "status": status,
-                        "status_error": status_err,
-                        "apply_rc": rc,
-                        "tty_rc": rc_tty,
+                        "digitizer_expected": result["digitizer_expected"],
+                        "digitizer_observed": result["digitizer_observed"],
+                        "digitizer_errors": result["digitizer_errors"],
+                        "digitizer_healthy": result["digitizer_healthy"],
+                        "digitizer_last_good": result["digitizer_last_good"],
+                        "digitizer_failure_count": result["digitizer_failure_count"],
+                        "status": result["status"],
+                        "status_error": result["status_error"],
+                        "apply_rc": result["apply_rc"],
+                        "tty_rc": result["tty_rc"],
+                        "recovery_attempted": result["recovery_attempted"],
+                        "recovery_rc": result["recovery_rc"],
+                        "recovery_reason": result["recovery_reason"],
+                        "retry_after_s": result["retry_after_s"],
                     },
                 )
                 last_apply_ts = time.monotonic()
@@ -553,62 +710,37 @@ def main(argv: list[str]) -> int:
 
             if enforce_every_s > 0 and (now - last_enforce_ts) >= enforce_every_s:
                 last_enforce_ts = now
+                if backoff_until_ts > now:
+                    time.sleep(args.interval_s)
+                    continue
                 desired = "half" if state.docked else "full"
                 expected_digitizer_mode = _digitizer_mode_for_desired(desired)
                 status, err = run_status(cmds.status, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
-                current = _status_mode(status) if status else None
-                if err:
-                    _log("enforce_check_error", docked=state.docked, modeid=state.modeid, desired=desired, error=err)
-                    _write_json_atomic(
-                        args.state_file,
-                        {
-                            "ts": utc_iso(),
-                            "event": "enforce_check_error",
-                            "dmi": dmi,
-                            "dock": state.__dict__,
-                            "desired": desired,
-                            "status_error": err,
-                        },
-                    )
-                elif current != expected_digitizer_mode:
+                current, device_errors, healthy = _observe_status(status, err)
+                if err or current != expected_digitizer_mode or device_errors or not healthy:
                     status_before = status
                     status_error_before = err
                     observed_before = current
-                    rc = run_cmd(
-                        cmds.half if state.docked else cmds.full,
-                        dry_run=args.dry_run,
-                        timeout_s=args.cmd_timeout_s,
-                    )
-                    rc_tty = None
-                    if args.tty_clip:
-                        rc_tty = run_cmd(
-                            _tty_cmd(desired, clear=False),
-                            dry_run=args.dry_run,
-                            timeout_s=args.cmd_timeout_s,
-                        )
-
-                    # Re-check status after applying so UI helpers don't act on
-                    # stale "before" state (e.g., touch mapping under sway_crop).
-                    status_after, status_error_after = run_status(
-                        cmds.status, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s
-                    )
-                    observed_after = _status_mode(status_after) if status_after else None
-
-                    observed = observed_after or observed_before
-                    status_write = status_after if status_after else status_before
-                    status_error_write = status_error_after if status_error_after is not None else status_error_before
-
+                    result = _apply_desired_mode(state, desired, tty_clear=False)
                     _log(
                         "enforce_apply",
                         docked=state.docked,
                         modeid=state.modeid,
                         desired=desired,
-                        digitizer_expected=expected_digitizer_mode,
-                        digitizer_observed=observed,
+                        digitizer_expected=result["digitizer_expected"],
+                        digitizer_observed=result["digitizer_observed"],
                         digitizer_observed_before=observed_before,
-                        digitizer_observed_after=observed_after,
-                        rc=rc,
-                        tty_rc=rc_tty,
+                        digitizer_observed_after=result["digitizer_observed"],
+                        digitizer_errors=result["digitizer_errors"],
+                        digitizer_healthy=result["digitizer_healthy"],
+                        digitizer_last_good=result["digitizer_last_good"],
+                        digitizer_failure_count=result["digitizer_failure_count"],
+                        recovery_attempted=result["recovery_attempted"],
+                        recovery_rc=result["recovery_rc"],
+                        recovery_reason=result["recovery_reason"],
+                        retry_after_s=result["retry_after_s"],
+                        rc=result["apply_rc"],
+                        tty_rc=result["tty_rc"],
                         since_last_apply_s=round(now - last_apply_ts, 3),
                     )
                     _write_json_atomic(
@@ -619,16 +751,24 @@ def main(argv: list[str]) -> int:
                             "dmi": dmi,
                             "dock": state.__dict__,
                             "desired": desired,
-                            "digitizer_expected": expected_digitizer_mode,
-                            "digitizer_observed": observed,
-                            "apply_rc": rc,
-                            "tty_rc": rc_tty,
-                            "status": status_write,
-                            "status_error": status_error_write,
+                            "digitizer_expected": result["digitizer_expected"],
+                            "digitizer_observed": result["digitizer_observed"],
+                            "digitizer_errors": result["digitizer_errors"],
+                            "digitizer_healthy": result["digitizer_healthy"],
+                            "digitizer_last_good": result["digitizer_last_good"],
+                            "digitizer_failure_count": result["digitizer_failure_count"],
+                            "apply_rc": result["apply_rc"],
+                            "tty_rc": result["tty_rc"],
+                            "status": result["status"],
+                            "status_error": result["status_error"],
                             "status_before": status_before,
-                            "status_after": status_after,
+                            "status_after": result["status"],
                             "status_error_before": status_error_before,
-                            "status_error_after": status_error_after,
+                            "status_error_after": result["status_error"],
+                            "recovery_attempted": result["recovery_attempted"],
+                            "recovery_rc": result["recovery_rc"],
+                            "recovery_reason": result["recovery_reason"],
+                            "retry_after_s": result["retry_after_s"],
                         },
                     )
                     last_apply_ts = now
@@ -690,24 +830,26 @@ def main(argv: list[str]) -> int:
                 "desired": desired,
             },
         )
-        rc = run_cmd(cmds.half if state.docked else cmds.full, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
-        rc_tty = None
-        if args.tty_clip:
-            rc_tty = run_cmd(_tty_cmd(desired, clear=(desired == "half")), dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
-        expected_digitizer_mode = _digitizer_mode_for_desired(desired)
-        status, status_err = run_status(cmds.status, dry_run=args.dry_run, timeout_s=args.cmd_timeout_s)
-        current = _status_mode(status) if status else None
+        result = _apply_desired_mode(state, desired, tty_clear=(desired == "half"))
         _log(
             "dock_change",
             from_docked=last.docked,
             to_docked=state.docked,
             modeid=state.modeid,
             desired=desired,
-            digitizer_expected=expected_digitizer_mode,
-            digitizer_observed=current,
-            status_error=status_err,
-            rc=rc,
-            tty_rc=rc_tty,
+            digitizer_expected=result["digitizer_expected"],
+            digitizer_observed=result["digitizer_observed"],
+            digitizer_errors=result["digitizer_errors"],
+            digitizer_healthy=result["digitizer_healthy"],
+            digitizer_last_good=result["digitizer_last_good"],
+            digitizer_failure_count=result["digitizer_failure_count"],
+            status_error=result["status_error"],
+            recovery_attempted=result["recovery_attempted"],
+            recovery_rc=result["recovery_rc"],
+            recovery_reason=result["recovery_reason"],
+            retry_after_s=result["retry_after_s"],
+            rc=result["apply_rc"],
+            tty_rc=result["tty_rc"],
         )
         _write_json_atomic(
             args.state_file,
@@ -719,12 +861,20 @@ def main(argv: list[str]) -> int:
                 "from_docked": last.docked,
                 "to_docked": state.docked,
                 "desired": desired,
-                "digitizer_expected": expected_digitizer_mode,
-                "digitizer_observed": current,
-                "status": status,
-                "status_error": status_err,
-                "apply_rc": rc,
-                "tty_rc": rc_tty,
+                "digitizer_expected": result["digitizer_expected"],
+                "digitizer_observed": result["digitizer_observed"],
+                "digitizer_errors": result["digitizer_errors"],
+                "digitizer_healthy": result["digitizer_healthy"],
+                "digitizer_last_good": result["digitizer_last_good"],
+                "digitizer_failure_count": result["digitizer_failure_count"],
+                "status": result["status"],
+                "status_error": result["status_error"],
+                "apply_rc": result["apply_rc"],
+                "tty_rc": result["tty_rc"],
+                "recovery_attempted": result["recovery_attempted"],
+                "recovery_rc": result["recovery_rc"],
+                "recovery_reason": result["recovery_reason"],
+                "retry_after_s": result["retry_after_s"],
             },
         )
         last_apply_ts = now
