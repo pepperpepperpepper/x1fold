@@ -37,6 +37,7 @@ This mirrors how the platform behaves under Windows: the “halfblank” effect 
   - `drm_clip.c`: DRM plane-clip helper (console-safe path; requires DRM master).
 - `scripts/`
   - `install_x1fold_halfblank.sh`: installs binaries + systemd units.
+  - `install_x1fold_fnctl.sh`: installs `x1fold-fnctl` and its persistence hooks for the keyboard-side Fn/Ctrl swap.
   - `install_x1fold_webcam.sh`: installs webcam helpers + optional OVTI5675 `ipu_bridge` DKMS override.
   - `x1fold-halfblank-ui-session.sh`: wrapper to run the UI helper inside the active Wayland session (exports `WAYLAND_DISPLAY`/`SWAYSOCK`).
   - `halfblank_switch.sh`: wrapper for `half|full|status`.
