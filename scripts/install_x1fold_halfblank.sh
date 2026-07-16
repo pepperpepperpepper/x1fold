@@ -75,6 +75,10 @@ if [[ -f "$x1fold_root/systemd/system-sleep/52-x1fold-wakeup-guard" ]]; then
   install -Dm0755 "$x1fold_root/systemd/system-sleep/52-x1fold-wakeup-guard" /usr/lib/systemd/system-sleep/52-x1fold-wakeup-guard
 fi
 
+if [[ -f "$x1fold_root/systemd/system-sleep/54-x1fold-mode-reassert" ]]; then
+  install -Dm0755 "$x1fold_root/systemd/system-sleep/54-x1fold-mode-reassert" /usr/lib/systemd/system-sleep/54-x1fold-mode-reassert
+fi
+
 if [[ -f "$x1fold_root/tools/x1fold_x11_blank.c" ]]; then
   if command -v cc >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1 && pkg-config --exists x11 xfixes; then
     tmp_bin="$(mktemp -t x1fold_x11_blank.XXXXXX)"

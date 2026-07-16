@@ -1,0 +1,72 @@
+#!/bin/sh
+set -eu
+
+# X1 Fold: on resume, re-read the keyboard dock state and reassert the Wacom
+# digitizer half/full latch to match it.
+#
+# Why: across suspend/resume the digitizer is power-cycled and re-bound (see
+# 51-x1fold-wacom-reset), and the halfblank daemon only reconverges on its next
+# poll/enforce tick -- which can be delayed if a recovery command was frozen
+# across the suspend. That leaves a window where the latch does not match the
+# current dock state. The visible symptom is "the bottom half of the touchscreen
+# is dead after waking the machine": the digitizer is stuck in "half" until the
+# daemon happens to catch up (or the keyboard is physically toggled).
+#
+# This hook makes the latch correct synchronously at resume time. It mirrors the
+# daemon's policy exactly (see x1fold_halfblankd.py: desired = half if docked
+# else full):
+#   docked   -> half   (keyboard on the bottom half; bottom-half touch off)
+#   undocked -> full   (whole panel touch-active)
+#   unknown  -> do nothing (leave the decision to the daemon)
+#
+# It only touches the digitizer latch (--display none); display/tty geometry is
+# owned by the halfblank UI and tty-rotate units. Best-effort: it never fails a
+# resume.
+
+[ "${1:-}" = "post" ] || exit 0
+
+DOCK_TOOL="${X1FOLD_DOCK_TOOL:-/usr/local/bin/x1fold_dock.py}"
+MODE_TOOL="${X1FOLD_MODE_TOOL:-/usr/local/bin/x1fold_mode.py}"
+PYTHON="${X1FOLD_PYTHON:-python3}"
+
+log() {
+  if command -v logger >/dev/null 2>&1; then
+    logger -t x1fold-mode-reassert -- "$@"
+  fi
+}
+
+[ -e "$DOCK_TOOL" ] || { log "dock tool missing: $DOCK_TOOL"; exit 0; }
+[ -e "$MODE_TOOL" ] || { log "mode tool missing: $MODE_TOOL"; exit 0; }
+
+# Read the dock state and map it to the desired latch: "half", "full", or ""
+# (unknown -> leave it to the daemon).
+desired="$(
+  "$PYTHON" "$DOCK_TOOL" status 2>/dev/null | "$PYTHON" -c '
+import json, sys
+try:
+    dock = json.load(sys.stdin).get("state", {}).get("docked")
+except Exception:
+    dock = None
+sys.stdout.write("half" if dock == 1 else "full" if dock == 0 else "")
+' 2>/dev/null || true
+)"
+
+if [ -z "$desired" ]; then
+  log "dock state unknown; leaving digitizer latch to the daemon"
+  exit 0
+fi
+
+# Reassert the latch. A couple of retries covers the brief post-rebind window
+# where the hidraw feature read can still return -121/EIO before settling.
+i=0
+while [ "$i" -lt 3 ]; do
+  if "$PYTHON" "$MODE_TOOL" set "$desired" --digitizer auto --display none >/dev/null 2>&1; then
+    log "reasserted digitizer latch: $desired"
+    exit 0
+  fi
+  i=$((i + 1))
+  sleep 0.3
+done
+
+log "failed to reassert digitizer latch ($desired) after retries; daemon will retry"
+exit 0
