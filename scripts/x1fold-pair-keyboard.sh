@@ -84,10 +84,32 @@ info_of() { bluetoothctl info "$1" 2>/dev/null || true; }
 alias_of() { info_of "$1" | awk -F': ' '/^\s*Alias:/{print $2; exit}'; }
 is_connected() { info_of "$1" | grep -q 'Connected: yes'; }
 
-# HID keyboards report appearance 0x03c1; BlueZ also derives an icon. Either is
-# enough to tell a keyboard apart from the ambient BLE noise.
+rssi_of() { info_of "$1" | awk -F': ' '/^\s*RSSI:/{print $2; exit}'; }
+
+# HID keyboards report appearance 0x03c1 and BlueZ derives an icon from it, but
+# neither is guaranteed to be populated for a device that has only ever been
+# seen in an advertisement. Fall back to the name, which is reliable for the
+# devices we care about here.
 looks_like_keyboard() {
-  info_of "$1" | grep -qiE 'Icon: input-keyboard|Appearance: 0x03c1'
+  local info
+  info="$(info_of "$1")"
+  grep -qiE 'Icon: input-keyboard|Appearance: 0x03c1' <<<"$info" && return 0
+  grep -qiE '^[[:space:]]*(Name|Alias):.*(keyboard|kbd)' <<<"$info"
+}
+
+# Which input nodes belong to which keyboard. With two units of the same model
+# every node has an identical name, and Phys is the *adapter* address, so uniq
+# (the keyboard's own address) is the only discriminator. Event numbers are not
+# stable across reconnects either.
+input_nodes_for() {
+  local mac="${1,,}" e uniq name
+  for e in /sys/class/input/event*; do
+    [[ -e "$e/device/uniq" ]] || continue
+    uniq="$(cat "$e/device/uniq" 2>/dev/null || true)"
+    [[ "${uniq,,}" == "$mac" ]] || continue
+    name="$(cat "$e/device/name" 2>/dev/null || true)"
+    printf '      /dev/input/%s  %s\n' "$(basename "$e")" "$name"
+  done
 }
 
 list_keyboards() {
@@ -95,9 +117,12 @@ list_keyboards() {
   while read -r _ mac _; do
     [[ -n "$mac" ]] || continue
     if looks_like_keyboard "$mac"; then
-      local state="known"
+      local state="known" rssi
       is_connected "$mac" && state="connected"
-      printf '  %s  %-11s %s\n' "$mac" "$state" "$(alias_of "$mac")"
+      rssi="$(rssi_of "$mac")"
+      printf '  %s  %-11s %s%s\n' "$mac" "$state" "$(alias_of "$mac")" \
+        "${rssi:+  (RSSI ${rssi})}"
+      [[ "$state" == "connected" ]] && input_nodes_for "$mac"
     fi
   done < <(bluetoothctl devices 2>/dev/null || true)
 }
@@ -192,8 +217,11 @@ if [[ -z "$TARGET" ]]; then
   if [[ ${#CANDIDATES[@]} -gt 1 ]]; then
     warn "More than one keyboard is advertising:"
     for c in "${CANDIDATES[@]}"; do
-      printf '    %s  %s\n' "$c" "$(alias_of "$c")" >&2
+      printf '    %s  %s%s\n' "$c" "$(alias_of "$c")" \
+        "$(r="$(rssi_of "$c")"; [[ -n "$r" ]] && printf '  (RSSI %s)' "$r")" >&2
     done
+    warn "Two units of the same model advertise identical names -- the"
+    warn "strongest RSSI is the one nearest to you."
     die "Rerun with the address you want: x1fold-pair-keyboard.sh <ADDRESS>"
   fi
   TARGET="${CANDIDATES[0]}"
@@ -241,6 +269,21 @@ attempt_pair() {
 
 : > "$LOG"
 
+# Two units of the same model produce identically-named input nodes, so show
+# which belongs to which -- this is what you need for per-keyboard keyd/hwdb
+# rules, and the mapping is not discoverable from the node names alone.
+report_input_nodes() {
+  local mac nodes
+  for mac in "$TARGET" "$OLD_KBD"; do
+    [[ -n "$mac" ]] || continue
+    is_connected "$mac" || continue
+    nodes="$(input_nodes_for "$mac")"
+    [[ -n "$nodes" ]] || continue
+    printf '    %s  %s\n' "$mac" "$(alias_of "$mac")"
+    printf '%s\n' "$nodes"
+  done
+}
+
 say "Attempt 1: pairing with the existing keyboard left connected"
 if attempt_pair no; then
   say "Paired and connected: $TARGET ${NAME:+($NAME)}"
@@ -251,6 +294,8 @@ if attempt_pair no; then
       reconnect_old "$OLD_KBD" || true
     fi
   fi
+  say "Input nodes (matched by device address, since the names are identical):"
+  report_input_nodes
   say "Log: $LOG"
   exit 0
 fi
@@ -262,6 +307,8 @@ sleep 3
 if attempt_pair yes; then
   say "Paired and connected: $TARGET ${NAME:+($NAME)}"
   reconnect_old "$OLD_KBD" || true
+  say "Input nodes (matched by device address, since the names are identical):"
+  report_input_nodes
   say "Log: $LOG"
   exit 0
 fi
