@@ -550,6 +550,15 @@ def _sway_set_input_calibration_matrix(
     return False, msg
 
 
+# Sway stores per-identifier input config and (re)applies it when a matching
+# device appears, so the mapping can be pushed even while the Wacom is
+# mid-rebind (i2c-hid reset, resume re-enumeration) and absent from get_inputs.
+X1FOLD_TOUCH_IDENTIFIER_FALLBACK = (
+    "1386:21178:Wacom_HID_52BA_Finger",
+    "1386:21178:Wacom_HID_52BA_Pen",
+)
+
+
 def _sway_set_x1fold_touch_map_from_region(sock: str, *, p1: str, p2: str) -> tuple[bool, str]:
     """
     Apply Sway's map_from_region to the X1 Fold internal touch + pen inputs.
@@ -571,7 +580,7 @@ def _sway_set_x1fold_touch_map_from_region(sock: str, *, p1: str, p2: str) -> tu
         ids.append(ident)
 
     if not ids:
-        return False, "no matching x1fold touch inputs"
+        ids = list(X1FOLD_TOUCH_IDENTIFIER_FALLBACK)
 
     errs: list[str] = []
     for ident in ids:
@@ -609,7 +618,7 @@ def _sway_set_x1fold_touch_calibration_matrix(
         ids.append(ident)
 
     if not ids:
-        return False, "no matching x1fold touch inputs"
+        ids = list(X1FOLD_TOUCH_IDENTIFIER_FALLBACK)
 
     errs: list[str] = []
     for ident in ids:
@@ -620,6 +629,194 @@ def _sway_set_x1fold_touch_calibration_matrix(
     if errs:
         return False, "; ".join(errs)
     return True, ""
+
+
+def _x1fold_touch_targets(
+    *,
+    desired: str,
+    method: str,
+    full_h: int | None,
+    active_size: int,
+    top_margin_px: int,
+    bottom_margin_px: int,
+) -> tuple[tuple[float, float, float, float, float, float], str, str] | None:
+    """
+    Expected (calibration_matrix, map_from_region p1, p2) for the internal
+    touch/pen. Single source of truth for both the apply path and the
+    steady-state verifier so they can never disagree.
+
+    Only sway_crop half mode needs scaling (the output is cropped but the
+    digitizer keeps its full-height ABS range); everything else is identity.
+    Returns None when half-mode targets can't be computed.
+    """
+
+    if method == "sway_crop" and desired == "half":
+        if not full_h or int(full_h) <= 0:
+            return None
+        y1_px = max(0, int(top_margin_px or 0))
+        y2_px = int(active_size) - max(0, int(bottom_margin_px or 0))
+        if y2_px <= y1_px:
+            return None
+        y_range_px = y2_px - y1_px
+        y_scale = float(full_h) / float(y_range_px)
+        y_trans = -float(y1_px) / float(y_range_px)
+        matrix = (1.0, 0.0, 0.0, 0.0, float(y_scale), float(y_trans))
+        y1 = max(0.0, min(1.0, float(y1_px) / float(full_h)))
+        y2 = max(0.0, min(1.0, float(y2_px) / float(full_h)))
+        return matrix, f"0x{_fmt_frac(y1)}", f"1x{_fmt_frac(y2)}"
+    return (1.0, 0.0, 0.0, 0.0, 1.0, 0.0), "0x0", "1x1"
+
+
+def _sway_apply_x1fold_touch_mapping(
+    sock: str,
+    *,
+    desired: str,
+    method: str,
+    outputs: list[dict[str, Any]] | None,
+    output: str | None,
+    digitizer_mode: str | None,
+    active_size: int,
+    top_margin_px: int,
+    bottom_margin_px: int,
+) -> dict[str, Any]:
+    """
+    Apply calibration_matrix + map_from_region for the internal touch/pen and
+    return an outcome dict ({desired, method, cm_ok, tm_ok, matrix}) that the
+    steady-state verifier uses to retry until both actually stick.
+    """
+
+    outcome: dict[str, Any] = {
+        "desired": desired,
+        "method": method,
+        "cm_ok": False,
+        "tm_ok": False,
+        "matrix": None,
+    }
+
+    half_crop = method == "sway_crop" and desired == "half"
+    full_h: int | None = None
+    if half_crop and outputs and output:
+        mode = _sway_output_current_mode(outputs, output)
+        full_h = mode[1] if mode else None
+
+    top_margin = max(0, int(top_margin_px or 0))
+    bottom_margin = max(0, int(bottom_margin_px or 0))
+    targets = _x1fold_touch_targets(
+        desired=desired,
+        method=method,
+        full_h=full_h,
+        active_size=int(active_size),
+        top_margin_px=top_margin,
+        bottom_margin_px=bottom_margin,
+    )
+    if targets is None:
+        _log(
+            "sway_touch_calibration_failed",
+            desired=desired,
+            output=output,
+            digitizer_mode=digitizer_mode,
+            active_size=int(active_size),
+            top_margin_px=top_margin,
+            bottom_margin_px=bottom_margin,
+            full_h=full_h,
+            error=(
+                "failed to read sway output current_mode"
+                if not full_h
+                else "invalid sway touch margins: active_size must be > top+bottom"
+            ),
+        )
+        return outcome
+
+    matrix, p1, p2 = targets
+    outcome["matrix"] = [float(v) for v in matrix]
+
+    cm_ok, cm_err = _sway_set_x1fold_touch_calibration_matrix(sock, matrix=matrix)
+    outcome["cm_ok"] = bool(cm_ok)
+    if half_crop:
+        _log(
+            "sway_touch_calibration_applied" if cm_ok else "sway_touch_calibration_failed",
+            desired=desired,
+            output=output,
+            digitizer_mode=digitizer_mode,
+            matrix=[float(v) for v in matrix],
+            active_size=int(active_size),
+            top_margin_px=top_margin,
+            bottom_margin_px=bottom_margin,
+            full_h=full_h,
+            **({} if cm_ok else {"error": cm_err}),
+        )
+    elif not cm_ok:
+        _log("sway_touch_calibration_reset_failed", desired=desired, output=output, error=cm_err)
+
+    tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(sock, p1=p1, p2=p2)
+    outcome["tm_ok"] = bool(tm_ok)
+    if half_crop:
+        _log(
+            "sway_touch_map_from_region_applied" if tm_ok else "sway_touch_map_from_region_failed",
+            desired=desired,
+            output=output,
+            digitizer_mode=digitizer_mode,
+            p1=p1,
+            p2=p2,
+            active_size=int(active_size),
+            top_margin_px=top_margin,
+            bottom_margin_px=bottom_margin,
+            full_h=full_h,
+            **({} if tm_ok else {"error": tm_err}),
+        )
+    elif not tm_ok:
+        _log("sway_touch_map_reset_failed", desired=desired, output=output, error=tm_err)
+    elif cm_ok:
+        # Resets used to succeed silently, which made the failure cases
+        # impossible to bracket in the journal.
+        _log("sway_touch_mapping_reset_applied", desired=desired, method=method, output=output)
+
+    return outcome
+
+
+def _sway_x1fold_touch_matrix_drift(
+    sock: str,
+    *,
+    expected: tuple[float, ...],
+    tol: float = 1e-3,
+) -> tuple[bool, dict[str, Any]] | None:
+    """
+    Compare the live calibration matrices of the internal touch/pen against
+    the expectation. Sway re-applies its stored per-identifier input config
+    when a device re-enumerates (i2c-hid rebind, resume), which can resurrect
+    the previous mode's matrix while the state file stays quiet.
+
+    Returns None when inputs can't be read or no matching devices are present
+    (nothing to verify yet); otherwise (drifted, details).
+    """
+
+    inputs = _sway_inputs(sock)
+    if inputs is None:
+        return None
+    seen = 0
+    drifted: dict[str, list[float]] = {}
+    for i in inputs:
+        ident = i.get("identifier")
+        if not (isinstance(ident, str) and ident):
+            continue
+        if i.get("vendor") != 1386 or i.get("product") != 21178:
+            continue
+        if i.get("type") not in {"touch", "tablet_tool"}:
+            continue
+        seen += 1
+        li = i.get("libinput")
+        matrix = li.get("calibration_matrix") if isinstance(li, dict) else None
+        if not (isinstance(matrix, list) and len(matrix) == len(expected)):
+            continue
+        try:
+            vals = [float(v) for v in matrix]
+        except (TypeError, ValueError):
+            continue
+        if any(abs(a - b) > tol for a, b in zip(vals, expected)):
+            drifted[ident] = vals
+    if seen == 0:
+        return None
+    return bool(drifted), {"devices_seen": seen, "drifted": drifted}
 
 
 def _xinput_list(display: str) -> list[tuple[int, str]]:
@@ -1136,6 +1333,11 @@ def main(argv: list[str]) -> int:
     last_sway_sock: str | None = None
     sensor_claim = SensorClaim()
     sensor_claim_enabled = False
+    # Outcome of the last touch/pen mapping apply; drives steady-state
+    # verification + retry (a one-shot apply can race a Wacom rebind).
+    touch_mapping: dict[str, Any] = {}
+    last_touch_verify = 0.0
+    touch_verify_every_s = 3.0
 
     while True:
         st = _read_state(args.state_file)
@@ -1369,6 +1571,43 @@ def main(argv: list[str]) -> int:
                 # must not be running.
                 if same_key and wl_blanker_running:
                     same_key = False
+
+            # The touch/pen mapping must converge even while the state file is
+            # quiet: the one-shot apply races Wacom i2c-hid rebinds (device
+            # missing from get_inputs at apply time), and sway re-applies its
+            # stored per-identifier config when the device re-enumerates,
+            # resurrecting the previous mode's matrix/region. Verify and force
+            # a re-apply until the mapping actually sticks.
+            if same_key and sway_sock and (now - last_touch_verify) >= touch_verify_every_s:
+                last_touch_verify = now
+                stale_reason: str | None = None
+                stale_extra: dict[str, Any] = {}
+                if (
+                    touch_mapping.get("desired") != desired
+                    or touch_mapping.get("method") != halfblank_method
+                    or not (touch_mapping.get("cm_ok") and touch_mapping.get("tm_ok"))
+                ):
+                    stale_reason = "apply_incomplete"
+                else:
+                    expected = touch_mapping.get("matrix")
+                    if isinstance(expected, list) and len(expected) == 6:
+                        drift = _sway_x1fold_touch_matrix_drift(
+                            sway_sock, expected=tuple(float(v) for v in expected)
+                        )
+                        if drift is not None and drift[0]:
+                            stale_reason = "matrix_drift"
+                            stale_extra = drift[1]
+                if stale_reason:
+                    _log(
+                        "sway_touch_mapping_stale",
+                        desired=desired,
+                        method=halfblank_method,
+                        reason=stale_reason,
+                        last_apply={k: touch_mapping.get(k) for k in ("desired", "method", "cm_ok", "tm_ok")},
+                        **stale_extra,
+                    )
+                    same_key = False
+
             if same_key:
                 if args.once:
                     return 0
@@ -1398,127 +1637,18 @@ def main(argv: list[str]) -> int:
                         # exposes the touch device with a full-height ABS
                         # range. Apply a calibration matrix so the top
                         # ACTIVE_PX region maps to the full cropped output.
-                        if sway_sock and desired == "half":
-                            mode = _sway_output_current_mode(outputs, sway_output) if outputs else None
-                            if mode:
-                                _, full_h = mode
-                                top_margin = max(0, int(args.sway_touch_top_margin_px or 0))
-                                bottom_margin = max(0, int(args.sway_touch_bottom_margin_px or 0))
-                                y1_px = top_margin
-                                y2_px = int(args.active_size) - bottom_margin
-                                if y2_px <= y1_px:
-                                    _log(
-                                        "sway_touch_calibration_failed",
-                                        desired=desired,
-                                        output=sway_output,
-                                        digitizer_mode=digitizer_mode,
-                                        active_size=int(args.active_size),
-                                        top_margin_px=int(top_margin),
-                                        bottom_margin_px=int(bottom_margin),
-                                        full_h=int(full_h),
-                                        error="invalid sway touch margins: active_size must be > top+bottom",
-                                    )
-                                else:
-                                    y_range_px = int(y2_px) - int(y1_px)
-                                    y_scale = float(full_h) / float(y_range_px)
-                                    y_trans = -float(y1_px) / float(y_range_px)
-                                    matrix = (1.0, 0.0, 0.0, 0.0, float(y_scale), float(y_trans))
-                                    cm_ok, cm_err = _sway_set_x1fold_touch_calibration_matrix(
-                                        sway_sock,
-                                        matrix=matrix,
-                                    )
-                                    if cm_ok:
-                                        _log(
-                                            "sway_touch_calibration_applied",
-                                            desired=desired,
-                                            output=sway_output,
-                                            digitizer_mode=digitizer_mode,
-                                            matrix=[float(v) for v in matrix],
-                                            active_size=int(args.active_size),
-                                            top_margin_px=int(top_margin),
-                                            bottom_margin_px=int(bottom_margin),
-                                            full_h=int(full_h),
-                                        )
-                                    else:
-                                        _log(
-                                            "sway_touch_calibration_failed",
-                                            desired=desired,
-                                            output=sway_output,
-                                            digitizer_mode=digitizer_mode,
-                                            matrix=[float(v) for v in matrix],
-                                            active_size=int(args.active_size),
-                                            top_margin_px=int(top_margin),
-                                            bottom_margin_px=int(bottom_margin),
-                                            full_h=int(full_h),
-                                            error=cm_err,
-                                        )
-
-                                    y1 = float(y1_px) / float(full_h)
-                                    y2 = float(y2_px) / float(full_h)
-                                    y1 = max(0.0, min(1.0, y1))
-                                    y2 = max(0.0, min(1.0, y2))
-                                    p1, p2 = f"0x{_fmt_frac(y1)}", f"1x{_fmt_frac(y2)}"
-                                    tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(
-                                        sway_sock,
-                                        p1=p1,
-                                        p2=p2,
-                                    )
-                                    if tm_ok:
-                                        _log(
-                                            "sway_touch_map_from_region_applied",
-                                            desired=desired,
-                                            output=sway_output,
-                                            digitizer_mode=digitizer_mode,
-                                            p1=p1,
-                                            p2=p2,
-                                            active_size=int(args.active_size),
-                                            top_margin_px=int(top_margin),
-                                            bottom_margin_px=int(bottom_margin),
-                                            full_h=int(full_h),
-                                        )
-                                    else:
-                                        _log(
-                                            "sway_touch_map_from_region_failed",
-                                            desired=desired,
-                                            output=sway_output,
-                                            digitizer_mode=digitizer_mode,
-                                            p1=p1,
-                                            p2=p2,
-                                            active_size=int(args.active_size),
-                                            top_margin_px=int(top_margin),
-                                            bottom_margin_px=int(bottom_margin),
-                                            full_h=int(full_h),
-                                            error=tm_err,
-                                        )
-                            else:
-                                _log(
-                                    "sway_touch_calibration_failed",
-                                    desired=desired,
-                                    output=sway_output,
-                                    digitizer_mode=digitizer_mode,
-                                    active_size=int(args.active_size),
-                                    error="failed to read sway output current_mode",
-                                )
-                        elif sway_sock:
-                            cm_ok, cm_err = _sway_set_x1fold_touch_calibration_matrix(
+                        if sway_sock:
+                            touch_mapping = _sway_apply_x1fold_touch_mapping(
                                 sway_sock,
-                                matrix=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+                                desired=desired,
+                                method="sway_crop",
+                                outputs=outputs,
+                                output=sway_output,
+                                digitizer_mode=digitizer_mode,
+                                active_size=int(args.active_size),
+                                top_margin_px=int(args.sway_touch_top_margin_px or 0),
+                                bottom_margin_px=int(args.sway_touch_bottom_margin_px or 0),
                             )
-                            if not cm_ok:
-                                _log(
-                                    "sway_touch_calibration_reset_failed",
-                                    desired=desired,
-                                    output=sway_output,
-                                    error=cm_err,
-                                )
-                            tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(sway_sock, p1="0x0", p2="1x1")
-                            if not tm_ok:
-                                _log(
-                                    "sway_touch_map_reset_failed",
-                                    desired=desired,
-                                    output=sway_output,
-                                    error=tm_err,
-                                )
                         _log(
                             "applied",
                             desired=desired,
@@ -1551,25 +1681,17 @@ def main(argv: list[str]) -> int:
                         # default. Only fall back for "half".
                         if desired == "full":
                             if sway_sock:
-                                cm_ok, cm_err = _sway_set_x1fold_touch_calibration_matrix(
+                                touch_mapping = _sway_apply_x1fold_touch_mapping(
                                     sway_sock,
-                                    matrix=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+                                    desired=desired,
+                                    method=halfblank_method,
+                                    outputs=outputs,
+                                    output=sway_output,
+                                    digitizer_mode=digitizer_mode,
+                                    active_size=int(args.active_size),
+                                    top_margin_px=int(args.sway_touch_top_margin_px or 0),
+                                    bottom_margin_px=int(args.sway_touch_bottom_margin_px or 0),
                                 )
-                                if not cm_ok:
-                                    _log(
-                                        "sway_touch_calibration_reset_failed",
-                                        desired=desired,
-                                        output=sway_output,
-                                        error=cm_err,
-                                    )
-                                tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(sway_sock, p1="0x0", p2="1x1")
-                                if not tm_ok:
-                                    _log(
-                                        "sway_touch_map_reset_failed",
-                                        desired=desired,
-                                        output=sway_output,
-                                        error=tm_err,
-                                    )
                             _log(
                                 "applied",
                                 desired=desired,
@@ -1615,25 +1737,17 @@ def main(argv: list[str]) -> int:
             )
             if ok:
                 if sway_sock:
-                    cm_ok, cm_err = _sway_set_x1fold_touch_calibration_matrix(
+                    touch_mapping = _sway_apply_x1fold_touch_mapping(
                         sway_sock,
-                        matrix=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+                        desired=desired,
+                        method="layer_shell",
+                        outputs=outputs,
+                        output=sway_output,
+                        digitizer_mode=digitizer_mode,
+                        active_size=int(args.active_size),
+                        top_margin_px=int(args.sway_touch_top_margin_px or 0),
+                        bottom_margin_px=int(args.sway_touch_bottom_margin_px or 0),
                     )
-                    if not cm_ok:
-                        _log(
-                            "sway_touch_calibration_reset_failed",
-                            desired=desired,
-                            output=sway_output,
-                            error=cm_err,
-                        )
-                    tm_ok, tm_err = _sway_set_x1fold_touch_map_from_region(sway_sock, p1="0x0", p2="1x1")
-                    if not tm_ok:
-                        _log(
-                            "sway_touch_map_reset_failed",
-                            desired=desired,
-                            output=sway_output,
-                            error=tm_err,
-                        )
                 # If we fell back from sway_crop, update last_key so we don't
                 # immediately retry sway_crop on the next loop.
                 if halfblank_method != key[4]:
