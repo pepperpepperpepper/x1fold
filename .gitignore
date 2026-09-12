@@ -11,3 +11,6 @@ __pycache__/
 # Local build products
 drm_clip
 x1fold_x11_blank
+
+# Large local artifacts
+*.iso
