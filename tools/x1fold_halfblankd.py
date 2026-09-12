@@ -601,6 +601,36 @@ def main(argv: list[str]) -> int:
             "digitizer_failure_count": digitizer_failure_count,
         }
 
+    def _abandon_pending_candidate(state: DockState, stable: DockState, candidate: DockState, *, reason: str) -> None:
+        """
+        A dock_change_candidate already published its desired mode to the state
+        file so UI helpers could react early. If the signal flaps back (or is
+        lost) before the debounce confirms, that published mode is wrong and UI
+        helpers would otherwise stay split from the digitizer policy until the
+        next unrelated state write. Publish the revert.
+        """
+
+        desired = "half" if stable.docked else "full"
+        _log(
+            "dock_change_abandoned",
+            candidate_docked=candidate.docked,
+            docked=state.docked,
+            desired=desired,
+            reason=reason,
+        )
+        _write_json_atomic(
+            args.state_file,
+            {
+                "ts": utc_iso(),
+                "event": "dock_change_abandoned",
+                "dmi": dmi,
+                "dock": state.__dict__,
+                "candidate_docked": candidate.docked,
+                "desired": desired,
+                "reason": reason,
+            },
+        )
+
     while True:
         state = read_dock_state(
             backend=args.backend,
@@ -613,6 +643,8 @@ def main(argv: list[str]) -> int:
         )
         if state.docked not in (0, 1):
             # We can't act without a stable signal; keep polling.
+            if pending is not None and last is not None:
+                _abandon_pending_candidate(state, last, pending, reason="signal_lost")
             pending = None
             pending_since = 0.0
             time.sleep(args.interval_s)
@@ -683,6 +715,8 @@ def main(argv: list[str]) -> int:
 
         now = time.monotonic()
         if state.docked == last.docked:
+            if pending is not None:
+                _abandon_pending_candidate(state, last, pending, reason="flap")
             pending = None
             pending_since = 0.0
             if args.tty_clip:
