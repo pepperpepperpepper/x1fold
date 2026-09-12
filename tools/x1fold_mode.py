@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -271,19 +272,36 @@ def select_wacf2200_col02_devices(devices: Iterable[HidrawDevice]) -> list[Hidra
     return selected
 
 
-def hid_get_feature(dev: HidrawDevice, report_id: int, size: int) -> bytes:
+def hid_get_feature(dev: HidrawDevice, report_id: int, size: int, *, min_len: int = 0) -> bytes:
+    """
+    Read a feature report and refuse to return implausible data.
+
+    HIDIOCGFEATURE returns the number of bytes the device actually produced;
+    the rest of the buffer stays zero-filled. On a flaky I2C bus a short or
+    shifted transfer can therefore look like an all-zero (= "full" latch)
+    report, so treat any read that is shorter than `min_len` or that doesn't
+    start with the requested report ID as an I/O error, not as data.
+    """
+
+    expect_id = report_id & 0xFF
+    floor_len = max(1, int(min_len))
     last_exc: OSError | None = None
     for attempt in range(3):
         fd = os.open(str(dev.dev), os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
         try:
             buf = bytearray(size)
             if size > 0:
-                buf[0] = report_id & 0xFF
-            fcntl.ioctl(fd, hidiocgfeature(size), buf, True)
+                buf[0] = expect_id
+            rlen = int(fcntl.ioctl(fd, hidiocgfeature(size), buf, True))
+            if rlen < floor_len or buf[0] != expect_id:
+                raise OSError(
+                    errno.EIO,
+                    f"implausible feature report (len={rlen}, first_byte=0x{buf[0]:02x}, want_id=0x{expect_id:02x})",
+                )
             return bytes(buf)
         except OSError as exc:
             last_exc = exc
-            if exc.errno in (110, 121) and attempt < 2:
+            if exc.errno in (errno.EIO, 110, 121) and attempt < 2:
                 time.sleep(0.15 * (attempt + 1))
                 continue
             raise
@@ -541,7 +559,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     for dev in candidates:
         entry: dict[str, Any] = dev.to_json()
         try:
-            r = hid_get_feature(dev, args.report_id, args.report_len)
+            r = hid_get_feature(dev, args.report_id, args.report_len, min_len=args.patch_offset + 6)
             entry["report_sha256"] = hashlib.sha256(r).hexdigest()
             entry["mode"] = report_mode(r, args.patch_offset)
             entry["bytes_10_15"] = _hex_bytes(r[args.patch_offset : args.patch_offset + 6])
@@ -606,7 +624,7 @@ def cmd_set(args: argparse.Namespace) -> int:
         for dev in candidates:
             row: dict[str, Any] = dev.to_json()
             try:
-                before = hid_get_feature(dev, args.report_id, args.report_len)
+                before = hid_get_feature(dev, args.report_id, args.report_len, min_len=args.patch_offset + 6)
                 row["before_mode"] = report_mode(before, args.patch_offset)
                 row["before_bytes_10_15"] = _hex_bytes(before[args.patch_offset : args.patch_offset + 6])
             except OSError as exc:
@@ -619,7 +637,7 @@ def cmd_set(args: argparse.Namespace) -> int:
         failures: list[str] = []
         for dev, row in zip(candidates, rows, strict=False):
             try:
-                verify = hid_get_feature(dev, args.report_id, args.report_len)
+                verify = hid_get_feature(dev, args.report_id, args.report_len, min_len=args.patch_offset + 6)
                 row["verify_mode"] = report_mode(verify, args.patch_offset)
                 row["verify_bytes_10_15"] = _hex_bytes(verify[args.patch_offset : args.patch_offset + 6])
                 if row.get("verify_mode") != args.mode:
@@ -636,22 +654,24 @@ def cmd_set(args: argparse.Namespace) -> int:
             row: dict[str, Any] = dev.to_json()
             wrote = False
             try:
-                before = hid_get_feature(dev, args.report_id, args.report_len)
+                before = hid_get_feature(dev, args.report_id, args.report_len, min_len=args.patch_offset + 6)
                 before_bytes = before[args.patch_offset : args.patch_offset + 6]
                 before_mode = report_mode(before, args.patch_offset)
                 row["before_mode"] = before_mode
                 row["before_bytes_10_15"] = _hex_bytes(before_bytes)
 
+                # Keep "already" for log analysis, but never let it skip the
+                # write: a garbled read that happened to decode as the target
+                # used to leave the latch stale with no verify to catch it.
                 if before_mode == args.mode:
                     row["already"] = True
+                after = patch_report(before, args.patch_offset, target)
+                row["after_bytes_10_15"] = _hex_bytes(after[args.patch_offset : args.patch_offset + 6])
+                if args.dry_run:
+                    row["dry_run"] = True
                 else:
-                    after = patch_report(before, args.patch_offset, target)
-                    row["after_bytes_10_15"] = _hex_bytes(after[args.patch_offset : args.patch_offset + 6])
-                    if args.dry_run:
-                        row["dry_run"] = True
-                    else:
-                        hid_set_feature(dev, after)
-                        wrote = True
+                    hid_set_feature(dev, after)
+                    wrote = True
             except OSError as exc:
                 failures.append(f"{dev.dev}: [{exc.errno}] {exc.strerror}")
                 row["error"] = f"[{exc.errno}] {exc.strerror}"
@@ -667,7 +687,7 @@ def cmd_set(args: argparse.Namespace) -> int:
             if not row.get("_wrote"):
                 continue
             try:
-                verify = hid_get_feature(dev, args.report_id, args.report_len)
+                verify = hid_get_feature(dev, args.report_id, args.report_len, min_len=args.patch_offset + 6)
                 row["verify_mode"] = report_mode(verify, args.patch_offset)
                 row["verify_bytes_10_15"] = _hex_bytes(verify[args.patch_offset : args.patch_offset + 6])
                 if row.get("verify_mode") != args.mode:
@@ -855,6 +875,8 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if args.report_len <= 0 or args.report_len > 4096:
         raise SystemExit("--report-len must be in 1..4096")
+    if args.patch_offset < 0 or args.report_len < args.patch_offset + 6:
+        raise SystemExit("--report-len must cover --patch-offset + 6 latch bytes")
     return int(args.fn(args))
 
 
