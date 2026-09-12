@@ -43,6 +43,7 @@ This mirrors how the platform behaves under Windows: the “halfblank” effect 
   - `halfblank_switch.sh`: wrapper for `half|full|status`.
   - `halfblank_regression.sh`: on-device loop test with logs.
   - `halfblank_collect.sh`: fetch logs from the device.
+  - `x1fold-pair-keyboard.sh`: pair an additional Bluetooth keyboard without losing input mid-way (see below).
 - `systemd/`
   - `x1fold-halfblankd.service`: system daemon unit.
   - `x1fold-tty-rotate.service`: system daemon unit for fbcon auto-rotate.
@@ -100,6 +101,34 @@ Regression loop (on-device, as root):
 ```bash
 halfblank_regression.sh -n 10
 ```
+
+### Pairing an additional Bluetooth keyboard
+
+The magnetic keyboard is what drives the halfblank dock signal, but a Bluetooth
+keyboard can be used alongside it. The X1 Fold's Intel AX211 holds several
+peripherals at once, so both keyboards can stay connected and both feed the
+same seat — there is no need to unpair one to use the other.
+
+```bash
+scripts/x1fold-pair-keyboard.sh            # auto-detect the keyboard in pairing mode
+scripts/x1fold-pair-keyboard.sh --list     # show keyboards known to BlueZ
+scripts/x1fold-pair-keyboard.sh --restore  # reconnect the previous keyboard
+```
+
+Run it from a real terminal: if the new keyboard requires a passkey, it is
+printed there and must be typed on the *new* keyboard.
+
+The script is written so a failed pairing can't leave you without input. It
+auto-detects the currently connected keyboard, tries to pair with that keyboard
+left connected, and only falls back to disconnecting it if the first attempt
+fails — reconnecting it afterwards either way. Candidates are filtered by HID
+keyboard appearance (`0x03c1`) / BlueZ icon so ambient BLE devices are not
+offered as targets, and if discovery finds nothing it exits before touching the
+existing connection.
+
+Note that `install_x1fold_fnctl.sh` is specific to the Lenovo keyboard's own HID
+report and does **not** apply to third-party Bluetooth keyboards; use `keyd` or
+a udev hwdb entry for those.
 
 ### Documentation
 
