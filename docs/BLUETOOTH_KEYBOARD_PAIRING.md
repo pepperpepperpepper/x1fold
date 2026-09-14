@@ -14,13 +14,59 @@ advertises. This document explains what is happening and how to work around it.
 x1fold-pair-keyboard.sh --watch
 ```
 
-Then hold the keyboard's **Bluetooth button** until its light changes. That is
-all. The watcher pairs it automatically the instant it advertises, and your
-existing keyboard stays connected the whole time.
+1. Hold the keyboard's **Bluetooth button** until its light changes — on this
+   model that is a slow double-pulse.
+2. When the script prints **PRESS ENTER ON THE NEW KEYBOARD**, do exactly that:
+   **press Enter on the keyboard being paired**, not on the one you are typing
+   on.
 
-Needs `sudo` (it reads raw HCI). If it has been running a while and nothing has
-happened, hold the button *longer* — see
+Step 2 is the whole ballgame. Read the next section before doing anything else.
+
+Needs `sudo` (it reads raw HCI). Your existing keyboard stays connected
+throughout. If nothing happens for a while, hold the button *longer* — see
 [Reconnect mode vs pairing mode](#reconnect-mode-vs-pairing-mode).
+
+## The step that wastes hours
+
+Pairing completes **only when Enter is pressed on the keyboard itself.**
+
+When pairing starts, the kernel emits:
+
+```
+hci0 E6:DE:D6:52:04:C2 User Confirm 000000 hint 1
+```
+
+That reads like a dialog on the computer waiting to be clicked. **It is not.**
+Nothing on the computer can answer it:
+
+- `bluetoothctl`'s agent cannot — including `NoInputNoOutput`, which is
+  supposed to auto-accept.
+- The desktop Bluetooth applet cannot. Under Sway it raises a "Connection
+  request" notification that disappears on its own, leaving nothing to click.
+- `btmgmt` run non-interactively cannot.
+
+The keyboard is sitting in passkey entry waiting for a keystroke. If none
+arrives it hangs up, and the trace shows:
+
+```
+Reason: Remote User Terminated Connection (0x13)
+Pairing with ... failed. status 0x03 (Failed)
+```
+
+That failure is not a bad link, a wrong address, or a BlueZ problem. It means
+nobody pressed Enter on the keyboard.
+
+### I/O capability matters
+
+Only `DisplayOnly` (`-c 0`) negotiates the method this keyboard accepts.
+
+| Capability | Method negotiated | Result |
+| --- | --- | --- |
+| `-c 4` KeyboardDisplay | Numeric comparison | `User Confirm`, nothing can answer → `0x03` |
+| `-c 3` NoInputNoOutput | Just Works | Keyboard refuses; it wants MITM protection → `0x03` |
+| **`-c 0` DisplayOnly** | **Passkey entry** | **Works — press Enter on the keyboard** |
+
+Override with `X1FOLD_PAIR_CAP` if a different unit needs something else.
 
 To see what the keyboard is currently doing without pairing:
 
@@ -188,12 +234,36 @@ sudo btmgmt --index 0 cancelpair -t 2 <ADDRESS>
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
+| **`status 0x03 (Failed)` after it connects** | **Nobody pressed Enter on the keyboard** | **Press Enter on the NEW keyboard when prompted** |
+| `Remote User Terminated Connection (0x13)` | Same — the keyboard gave up waiting | Same |
+| "Connection request" notification vanishes | Sway has no agent that can hold the dialog | Ignore it; the answer is Enter on the keyboard, not a click |
 | `Device ... not available` | Advertising with flags `0x04`, filtered by BlueZ | Hold the Bluetooth button until it reaches pairing mode; use `--watch` |
 | `--check` says `reconnect only` | Still bonded to another host | Hold the button longer to clear the bond |
 | `--check` says nothing heard | Not advertising; window expired | Press the button again; `--watch` waits for you |
 | `Connect Failed (0x04)` / `0x3e` | Connected in reconnect mode, keyboard dropped us | Same as above — it needs real pairing mode |
 | `Busy (0x0a)` | Earlier pairing still pending in kernel | `btmgmt cancelpair`, or just rerun `--watch` |
 | Paired but no keystrokes | Bonded but not connected | `bluetoothctl connect <addr>` |
+| Works now, dead after reboot | Bonded but not trusted | `bluetoothctl trust <addr>` (`--watch` does this automatically) |
+
+## Doing it entirely by hand
+
+If the script is unavailable, this is the whole procedure:
+
+```bash
+# 1. Find the address while holding the keyboard's Bluetooth button.
+sudo btmon > /tmp/b.log &
+bluetoothctl --timeout 20 scan on
+grep -B20 'Appearance: Keyboard' /tmp/b.log | grep -E 'Address:|Flags:|Name'
+#    Flags must be 0x06. 0x04 means hold the button longer.
+
+# 2. Pair by address. BlueZ discovery is not involved.
+sudo btmgmt --index 0 pair -t 2 -c 0 <ADDRESS>
+
+# 3. When it prints "User Confirm", PRESS ENTER ON THE NEW KEYBOARD.
+
+# 4. Trust it so it reconnects after a reboot.
+bluetoothctl trust <ADDRESS>
+```
 
 ## Wired fallback
 

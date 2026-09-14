@@ -285,6 +285,13 @@ SCAN_GAP="${SCAN_GAP:-2}"
 
 start_background_scan() {
   local total="$1"
+  # The subshell's stdout MUST be redirected. This function is called inside a
+  # command substitution to capture the PID, and a background job started there
+  # inherits that substitution's stdout pipe -- so $( ) blocks until the job
+  # finishes, which is the entire watch window. That silently serialised the
+  # whole watcher: it sat here for WATCH_SECS, started btmon only afterwards,
+  # and then immediately gave up, so btmon never appeared in ps and not a
+  # single advertisement was ever read.
   (
     local spent=0
     while (( spent < total )); do
@@ -293,30 +300,82 @@ start_background_scan() {
       sleep "$SCAN_GAP"
       spent=$(( spent + burst + SCAN_GAP ))
     done
-  ) &
+  ) >/dev/null 2>&1 &
   printf '%s' "$!"
 }
 
-# Capability matters here. With KeyboardDisplay (-c 4) this keyboard answers
-# with "User Confirm 000000 hint 1" and waits for an acknowledgement; btmgmt
-# run non-interactively has no way to give one, so the link drops and pairing
-# fails with status 0x03. NoInputNoOutput (-c 3) selects Just Works, which
-# needs no confirmation. Try that first and keep -c 4 as a fallback.
+# THE STEP EVERYONE MISSES: this keyboard completes pairing only when Enter is
+# pressed ON THE KEYBOARD ITSELF.
+#
+# The kernel reports the request as
+#
+#     hci0 <addr> User Confirm 000000 hint 1
+#
+# which reads like a host-side dialog waiting to be clicked. It is not. Nothing
+# on the computer can answer it -- not bluetoothctl's agent, not the desktop
+# Bluetooth applet (which on Sway shows a notification that vanishes), not
+# btmgmt. The keyboard is sitting in passkey entry waiting for a keystroke, and
+# the link is torn down with "Remote User Terminated Connection (0x13)" when
+# none arrives.
+#
+# So the only job of this function is to start the pairing, then tell the user
+# loudly and in time to press Enter on the new keyboard.
+#
+# Use DisplayOnly (-c 0). KeyboardDisplay and NoInputNoOutput both negotiate a
+# method this keyboard rejects outright (status 0x03).
+PAIR_CAP="${X1FOLD_PAIR_CAP:-0}"
+
+announce_press_enter() {
+  local passkey="${1:-}"
+  printf '\n'
+  printf '\033[1;33m  ┌────────────────────────────────────────────────┐\033[0m\n'
+  if [[ -n "$passkey" && "$passkey" != "000000" ]]; then
+    printf '\033[1;33m  │  TYPE %-8s ON THE NEW KEYBOARD, THEN ENTER │\033[0m\n' "$passkey"
+  else
+    printf '\033[1;33m  │  PRESS ENTER ON THE NEW KEYBOARD NOW           │\033[0m\n'
+  fi
+  printf '\033[1;33m  │  (on the keyboard being paired, not this one)   │\033[0m\n'
+  printf '\033[1;33m  └────────────────────────────────────────────────┘\033[0m\n\n'
+}
+
 pair_now() {
-  local addr="$1" cap
+  local addr="$1"
+  local out="${LOG}.pair"
+
   # Clear anything pending, or the kernel answers Busy (0x0a).
   sudo -n btmgmt --index 0 cancelpair -t 2 "$addr" </dev/null >/dev/null 2>&1 || true
   sleep 1
-  for cap in 3 4; do
-    say "Pairing with $addr (io-capability $cap)"
-    sudo -n timeout 60 btmgmt --index 0 pair -t 2 -c "$cap" "$addr" </dev/null 2>&1 \
-      | tee -a "$LOG"
-    if is_paired "$addr"; then
-      return 0
+
+  : > "$out"
+  say "Pairing with $addr (io-capability $PAIR_CAP)"
+  sudo -n timeout "$PAIR_WINDOW" btmgmt --index 0 pair -t 2 -c "$PAIR_CAP" "$addr" \
+    </dev/null >"$out" 2>&1 &
+  local pid=$!
+
+  # Surface the prompt the instant the kernel raises it -- the keyboard only
+  # waits a few seconds, so printing this after the fact is useless.
+  local announced=0 waited=0 passkey=""
+  while kill -0 "$pid" 2>/dev/null; do
+    if [[ $announced -eq 0 ]] && grep -qiE "User Confirm|Passkey|Confirm Request" "$out" 2>/dev/null; then
+      passkey="$(grep -oiE "(User Confirm|Passkey[: ]+)[0-9]{6}" "$out" 2>/dev/null \
+        | grep -oE '[0-9]{6}' | head -1)"
+      announce_press_enter "$passkey"
+      announced=1
     fi
-    sudo -n btmgmt --index 0 cancelpair -t 2 "$addr" </dev/null >/dev/null 2>&1 || true
     sleep 1
+    waited=$((waited + 1))
   done
+  wait "$pid" 2>/dev/null || true
+  cat "$out" >>"$LOG" 2>/dev/null || true
+
+  if is_paired "$addr"; then
+    return 0
+  fi
+  if [[ $announced -eq 1 ]]; then
+    warn "The confirmation appeared but pairing did not complete."
+    warn "That almost always means Enter was not pressed on the NEW keyboard in time."
+  fi
+  sudo -n btmgmt --index 0 cancelpair -t 2 "$addr" </dev/null >/dev/null 2>&1 || true
   return 1
 }
 
@@ -367,9 +426,39 @@ cmd_watch() {
   say "Hold the new keyboard's Bluetooth button now -- pairing is automatic."
   say "Your existing keyboard stays connected. Ctrl-C to stop."
 
-  local sp; sp="$(start_background_scan "$WATCH_SECS")"
-  # Re-arm the scan periodically; bluetoothctl's --timeout ends it.
-  trap 'kill "$sp" 2>/dev/null || true' EXIT
+  # btmon writes to a plain file and we tail it. This looks roundabout; it is
+  # the only form that reliably works here.
+  #
+  #   done < <(sudo btmon | awk ...)   btmon never started at all in a
+  #                                    background/non-tty context, and the read
+  #                                    loop then blocked forever on a pipe that
+  #                                    would never produce anything. The watcher
+  #                                    printed its banner, looked healthy, and
+  #                                    saw nothing -- twice -- while the keyboard
+  #                                    advertised a foot away.
+  #
+  #   btmon > fifo &                   Opening a FIFO for write blocks until a
+  #                                    reader attaches, so btmon still did not
+  #                                    exec until too late.
+  #
+  #   btmon > file & tail -f file      Starts immediately, every time.
+  #
+  # SCAN_PID/MON_PID are globals: an EXIT trap cannot reference a
+  # function-local, which under `set -u` aborts the script during cleanup.
+  SCAN_PID=""; MON_PID=""; RAW="${LOG}.hci"
+  trap 'kill "${SCAN_PID:-}" "${MON_PID:-}" 2>/dev/null || true
+        pkill -f "tail -f -n +1 ${RAW}" 2>/dev/null || true' EXIT
+
+  SCAN_PID="$(start_background_scan "$WATCH_SECS")"
+
+  : > "$RAW"
+  sudo -n timeout "$WATCH_SECS" btmon > "$RAW" 2>/dev/null &
+  MON_PID=$!
+
+  sleep 2
+  if ! pgrep -x btmon >/dev/null 2>&1; then
+    die "btmon did not start -- check that 'sudo -n btmon' works"
+  fi
 
   local addr flags rssi name
   local -A tried=()
@@ -403,19 +492,23 @@ cmd_watch() {
     say "Keyboard in PAIRING MODE: $addr '$name' (flags=$flags, RSSI=$rssi)"
     if pair_now "$addr"; then
       say "Paired: $addr"
-      sudo -n btmgmt --index 0 pairable on </dev/null >/dev/null 2>&1 || true
+      # Trust it, or it will not reconnect on its own after a reboot.
       bluetoothctl trust "$addr" >/dev/null 2>&1 || true
       bluetoothctl connect "$addr" >/dev/null 2>&1 || true
       sleep 3
-      say "Input nodes (matched by address -- the names are identical):"
+      say "Input nodes (matched by address):"
       TARGET="$addr"
       report_input_nodes
       say "Log: $LOG"
-      return 0
+      # The loop body runs in a subshell because of the pipeline below, so a
+      # plain `return` would not leave cmd_watch. Exit the script outright.
+      exit 0
     fi
     warn "Pairing $addr failed; still watching."
     tried[$addr]=""
-  done < <(sudo -n timeout "$WATCH_SECS" btmon 2>/dev/null | awk "$ADV_FILTER")
+  # --pid makes tail exit when btmon does; without it tail -f holds the pipe
+  # open forever and the loop never reaches the "gave up" path.
+  done < <(tail -f -n +1 --pid="$MON_PID" "$RAW" 2>/dev/null | awk "$ADV_FILTER")
 
   warn "Gave up after ${WATCH_SECS}s without a keyboard entering pairing mode."
   return 1

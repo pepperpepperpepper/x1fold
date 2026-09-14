@@ -116,13 +116,21 @@ scripts/x1fold-pair-keyboard.sh --list     # show keyboards known to BlueZ + inp
 scripts/x1fold-pair-keyboard.sh --restore  # reconnect the previous keyboard
 ```
 
-**These keyboards do not pair through the normal Linux path.** The Bluetooth
-GUI won't show them, and `bluetoothctl pair` reports `Device ... not available`
-while the keyboard is actively advertising a few inches away. That is not a
-fault in the machine: the keyboard advertises with no discoverable bit set when
-it is already bonded to another host, and BlueZ drops such advertisements
-before they become device objects. A five-minute scan here catalogued 195
-devices without listing the keyboard, while raw HCI showed it the entire time.
+**The step that wastes hours: pairing completes only when you press Enter on
+the keyboard being paired.** The kernel reports `User Confirm 000000 hint 1`,
+which looks like a dialog on the computer waiting to be clicked. Nothing on the
+computer can answer it — not `bluetoothctl`'s agent, not the desktop applet
+(under Sway it flashes a notification that vanishes), not `btmgmt`. The
+keyboard is waiting for a keystroke, and hangs up if none arrives.
+
+**These keyboards also do not pair through the normal Linux path.** The
+Bluetooth GUI won't show them, and `bluetoothctl pair` reports `Device ... not
+available` while the keyboard is actively advertising a few inches away. That
+is not a fault in the machine: the keyboard advertises with no discoverable bit
+set when it is already bonded to another host, and BlueZ drops such
+advertisements before they become device objects. A five-minute scan here
+catalogued 195 devices without listing the keyboard, while raw HCI showed it
+the entire time.
 
 `--watch` sidesteps this by monitoring raw HCI and pairing through the kernel
 management interface, which needs no scan cycle and no D-Bus device object. It
