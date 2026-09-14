@@ -26,14 +26,27 @@ interface the moment a keyboard advertises, which needs no scan cycle.
 See docs/BLUETOOTH_KEYBOARD_PAIRING.md for the full explanation, including why
 the GUI and every bluetoothctl recipe fail on this hardware.
 
+DON'T PAIR AT ALL ON A REINSTALL. The pairing keys live on disk. Back them up
+now, restore them after reimaging, and both keyboards work immediately with no
+buttons, no passkeys, no pairing mode:
+
+  x1fold-pair-keyboard.sh --backup-bonds ~/kbd-bonds.tar.gz   # before wiping
+  x1fold-pair-keyboard.sh --restore-bonds ~/kbd-bonds.tar.gz  # after reimaging
+
+This only works on the same physical adapter -- the keys are tied to its
+address. The backup contains link keys: treat it like a private key, and do not
+commit it to a repository.
+
 Options:
-  --watch     Watch continuously and auto-pair any keyboard that enters
-              pairing mode. Needs sudo (raw HCI). Ctrl-C to stop.
-  --check     Report whether a keyboard is advertising and whether it is in
-              real pairing mode or only reconnect mode. Needs sudo.
-  --restore   Reconnect the previously connected keyboard and exit.
-  --list      List connected/known keyboards and exit.
-  -h, --help  Show this help.
+  --watch            Watch continuously and auto-pair any keyboard that enters
+                     pairing mode. Needs sudo (raw HCI). Ctrl-C to stop.
+  --check            Report whether a keyboard is advertising and whether it is
+                     in real pairing mode or only reconnect mode. Needs sudo.
+  --backup-bonds F   Save this adapter's pairing keys to F (mode 0600).
+  --restore-bonds F  Restore pairing keys from F and restart bluetooth.
+  --restore          Reconnect the previously connected keyboard and exit.
+  --list             List connected/known keyboards and exit.
+  -h, --help         Show this help.
 
 Environment:
   X1FOLD_OLD_KBD   Address of the existing keyboard (default: auto-detect the
@@ -53,12 +66,21 @@ EOF
 
 MODE="pair"
 TARGET=""
+BOND_FILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --watch) MODE="watch"; shift ;;
     --check) MODE="check"; shift ;;
+    --backup-bonds)
+      MODE="backup-bonds"
+      [[ $# -ge 2 ]] || { echo "--backup-bonds needs a file path" >&2; exit 2; }
+      BOND_FILE="$2"; shift 2 ;;
+    --restore-bonds)
+      MODE="restore-bonds"
+      [[ $# -ge 2 ]] || { echo "--restore-bonds needs a file path" >&2; exit 2; }
+      BOND_FILE="$2"; shift 2 ;;
     --restore) MODE="restore"; shift ;;
     --list) MODE="list"; shift ;;
     -*) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -514,9 +536,95 @@ cmd_watch() {
   return 1
 }
 
+# --- bond backup / restore ------------------------------------------------- #
+#
+# The whole pairing dance exists only because there is no key on this machine
+# for the keyboard. Keep the keys and a reinstall needs no pairing at all.
+#
+# The keys are bound to the adapter's address, so this restores onto the same
+# physical Bluetooth controller only. Restoring onto a different adapter leaves
+# records the keyboard will refuse, because the keyboard also stored *our*
+# identity when it bonded.
+
+BT_LIB="/var/lib/bluetooth"
+
+adapter_addr() {
+  bluetoothctl list 2>/dev/null | awk '/^Controller /{print $2; exit}'
+}
+
+cmd_backup_bonds() {
+  local out="$1"
+  local adapter; adapter="$(adapter_addr)"
+  [[ -n "$adapter" ]] || die "no Bluetooth controller found"
+  sudo -n true 2>/dev/null || die "--backup-bonds needs sudo ($BT_LIB is root-only)"
+  sudo -n test -d "$BT_LIB/$adapter" || die "no bond directory for adapter $adapter"
+
+  local parent; parent="$(dirname -- "$out")"
+  [[ -d "$parent" ]] || die "no such directory: $parent"
+
+  # Create the file as the user first with tight permissions, so the keys are
+  # never briefly world-readable.
+  ( umask 077; : > "$out" ) || die "cannot write $out"
+  chmod 600 "$out"
+
+  sudo -n tar -czf "$out" -C "$BT_LIB" "$adapter" || die "backup failed"
+  sudo -n chown "$(id -u):$(id -g)" "$out"
+  chmod 600 "$out"
+
+  say "Saved pairing keys for adapter $adapter"
+  printf '    %s  (%s)\n' "$out" "$(du -h "$out" | cut -f1)"
+  say "Devices included:"
+  sudo -n find "$BT_LIB/$adapter" -maxdepth 1 -mindepth 1 -type d ! -name cache \
+    -printf '    %f\n' 2>/dev/null
+  warn "This file contains Bluetooth link keys. Keep it private; do not commit it."
+  say "Restore after a reinstall with:"
+  printf '    x1fold-pair-keyboard.sh --restore-bonds %s\n' "$out"
+}
+
+cmd_restore_bonds() {
+  local in="$1"
+  [[ -f "$in" ]] || die "no such file: $in"
+  sudo -n true 2>/dev/null || die "--restore-bonds needs sudo"
+
+  local adapter; adapter="$(adapter_addr)"
+  [[ -n "$adapter" ]] || die "no Bluetooth controller found"
+
+  local in_archive
+  in_archive="$(tar -tzf "$in" 2>/dev/null | head -1 | cut -d/ -f1)"
+  [[ -n "$in_archive" ]] || die "$in is not a readable tar.gz"
+
+  if [[ "${in_archive^^}" != "${adapter^^}" ]]; then
+    warn "Backup is for adapter $in_archive but this machine's adapter is $adapter."
+    warn "Bluetooth pairing keys are bound to the adapter address, so these"
+    warn "records will not work here -- the keyboards must be paired normally."
+    die "refusing to restore a mismatched adapter"
+  fi
+
+  say "Restoring pairing keys for adapter $adapter"
+  sudo -n systemctl stop bluetooth 2>/dev/null || true
+  sleep 1
+  sudo -n tar -xzf "$in" -C "$BT_LIB" || die "restore failed"
+  sudo -n chown -R root:root "$BT_LIB/$adapter"
+  sudo -n chmod -R go-rwx "$BT_LIB/$adapter"
+  sudo -n systemctl start bluetooth 2>/dev/null || true
+  sleep 3
+
+  say "Restored. Known devices:"
+  bluetoothctl devices Paired 2>/dev/null | sed 's/^/    /'
+  say "Turn the keyboards on; they should reconnect without pairing."
+}
+
 OLD_KBD="$(detect_old_kbd)"
 
 case "$MODE" in
+  backup-bonds)
+    cmd_backup_bonds "$BOND_FILE"
+    exit $?
+    ;;
+  restore-bonds)
+    cmd_restore_bonds "$BOND_FILE"
+    exit $?
+    ;;
   watch)
     cmd_watch
     exit $?

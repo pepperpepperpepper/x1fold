@@ -10,6 +10,7 @@ Installs the X1 Fold halfblank tooling into a live system:
   - /usr/local/bin/{x1fold_mode.py,x1fold_dock.py,x1fold_halfblankd.py,x1fold_halfblank_ui.py,x1fold_tty.py,x1fold_tty_rotate.py}
   - /usr/local/bin/x1fold-halfblank-ui-session
   - /usr/local/bin/{halfblank_switch.sh,halfblank_regression.sh,halfblank_collect.sh}
+  - /usr/local/bin/x1fold-pair-keyboard
   - /etc/systemd/system/{x1fold-halfblankd.service,x1fold-tty-rotate.service}
   - /usr/lib/systemd/user/x1fold-halfblank-ui.service
 
@@ -120,11 +121,20 @@ fi
 install -Dm0755 "$x1fold_root/scripts/halfblank_switch.sh" /usr/local/bin/halfblank_switch.sh
 install -Dm0755 "$x1fold_root/scripts/halfblank_regression.sh" /usr/local/bin/halfblank_regression.sh
 install -Dm0755 "$x1fold_root/scripts/halfblank_collect.sh" /usr/local/bin/halfblank_collect.sh
+install -Dm0755 "$x1fold_root/scripts/x1fold-pair-keyboard.sh" /usr/local/bin/x1fold-pair-keyboard
 
 install -Dm0644 "$x1fold_root/systemd/x1fold-halfblankd.service" /etc/systemd/system/x1fold-halfblankd.service
 install -Dm0644 "$x1fold_root/systemd/user/x1fold-halfblank-ui.service" /usr/lib/systemd/user/x1fold-halfblank-ui.service
 if [[ -f "$x1fold_root/systemd/x1fold-tty-rotate.service" ]]; then
   install -Dm0644 "$x1fold_root/systemd/x1fold-tty-rotate.service" /etc/systemd/system/x1fold-tty-rotate.service
+fi
+# On-demand only; deliberately not enabled.
+if [[ -f "$x1fold_root/systemd/x1fold-pair-keyboard.service" ]]; then
+  install -Dm0644 "$x1fold_root/systemd/x1fold-pair-keyboard.service" /etc/systemd/system/x1fold-pair-keyboard.service
+fi
+if [[ -f "$x1fold_root/docs/BLUETOOTH_KEYBOARD_PAIRING.md" ]]; then
+  install -Dm0644 "$x1fold_root/docs/BLUETOOTH_KEYBOARD_PAIRING.md" \
+    /usr/local/share/doc/x1fold/BLUETOOTH_KEYBOARD_PAIRING.md
 fi
 
 systemctl daemon-reload

@@ -14,3 +14,7 @@ x1fold_x11_blank
 
 # Large local artifacts
 *.iso
+
+# Bluetooth bond backups contain link keys -- never commit them.
+*bonds*.tar.gz
+kbd-bonds*

@@ -1,0 +1,22 @@
+[Unit]
+# On-demand keyboard pairing. Not enabled -- start it when you want to pair:
+#
+#     sudo systemctl start x1fold-pair-keyboard
+#     (hold the keyboard's Bluetooth button, then press Enter ON THAT KEYBOARD)
+#     journalctl -fu x1fold-pair-keyboard
+#
+# Runs as root so btmon/btmgmt need no sudo, and watches for ten minutes.
+Description=Pair an X1 Fold Bluetooth keyboard (on demand)
+Documentation=file:/usr/local/share/doc/x1fold/BLUETOOTH_KEYBOARD_PAIRING.md
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=oneshot
+Environment=WATCH_SECS=600
+ExecStart=/usr/local/bin/x1fold-pair-keyboard --watch
+# Pairing is a deliberate act; never retry on its own.
+Restart=no
+TimeoutStartSec=660
+StandardOutput=journal
+StandardError=journal

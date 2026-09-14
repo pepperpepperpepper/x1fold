@@ -116,6 +116,17 @@ scripts/x1fold-pair-keyboard.sh --list     # show keyboards known to BlueZ + inp
 scripts/x1fold-pair-keyboard.sh --restore  # reconnect the previous keyboard
 ```
 
+**Reinstalling this machine? Don't pair again — keep the keys:**
+
+```bash
+x1fold-pair-keyboard --backup-bonds ~/kbd-bonds.tar.gz    # before wiping
+x1fold-pair-keyboard --restore-bonds ~/kbd-bonds.tar.gz   # after reimaging
+```
+
+Same adapter only (the keys are bound to its address; a mismatch is refused
+rather than silently restored). The backup contains Bluetooth link keys — it is
+written mode `0600`, keep it private, and never commit it.
+
 **The step that wastes hours: pairing completes only when you press Enter on
 the keyboard being paired.** The kernel reports `User Confirm 000000 hint 1`,
 which looks like a dialog on the computer waiting to be clicked. Nothing on the

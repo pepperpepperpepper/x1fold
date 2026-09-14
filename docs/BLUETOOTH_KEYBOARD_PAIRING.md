@@ -78,6 +78,50 @@ x1fold-pair-keyboard.sh --check
 E6:DE:D6:52:04:C2  X1FKeyboard    flags=0x06 RSSI=-59  ==> PAIRING MODE, ready to pair
 ```
 
+## Never do this again: back up the pairing keys
+
+Pairing is only hard because the machine has no key for the keyboard. The keys
+live in `/var/lib/bluetooth/<adapter>/<device>/info`, so keep a copy and a
+reinstall needs no pairing at all — no buttons, no passkeys, no pairing mode.
+
+```bash
+# Before wiping the machine
+x1fold-pair-keyboard --backup-bonds ~/kbd-bonds.tar.gz
+
+# After reimaging, then just switch the keyboards on
+x1fold-pair-keyboard --restore-bonds ~/kbd-bonds.tar.gz
+```
+
+Constraints worth knowing:
+
+- **Same adapter only.** The keys are bound to the controller's address, and
+  the keyboard stored *our* identity when it bonded. Restoring onto different
+  Bluetooth hardware produces records the keyboard rejects. `--restore-bonds`
+  compares the adapter address and refuses rather than leaving you with dead
+  bonds that look valid.
+- **The backup is a secret.** It contains `LongTermKey` and
+  `IdentityResolvingKey` — anyone holding it can impersonate your machine to
+  those keyboards. It is written mode `0600`; keep it that way, and do not
+  commit it to a repository.
+- Restoring stops and restarts `bluetooth.service`.
+
+Put the backup wherever your dotfiles/secrets already go. This is the single
+highest-value thing in this document: it converts an afternoon into one command.
+
+## Running it as a service
+
+The installer drops an on-demand unit. Nothing is enabled — pairing is a
+deliberate act, and a service that retries forever is how you get 8,000
+restarts in a journal.
+
+```bash
+sudo systemctl start x1fold-pair-keyboard      # watches for 10 minutes
+journalctl -fu x1fold-pair-keyboard            # watch it work
+```
+
+Hold the keyboard's Bluetooth button, then press Enter on that keyboard when
+the journal asks.
+
 ## Why the normal tools fail
 
 ### Reconnect mode vs pairing mode
