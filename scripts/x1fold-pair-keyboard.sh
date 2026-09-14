@@ -220,8 +220,13 @@ need_hci_tools() {
 # plain `read` captures names containing spaces.
 ADV_FILTER='
   function flush_rec() {
-      if (kbd && addr != "")
+      if (kbd && addr != "") {
           print addr, (flags == "" ? "0x00" : flags), rssi, (name == "" ? "-" : name)
+          # awk block-buffers when stdout is a pipe, so without this the reader
+          # sees nothing until 4KB accumulates -- which never happens here, and
+          # made --watch silently useless.
+          fflush()
+      }
       kbd=0; addr=""; flags=""; rssi="?"; name=""
   }
   /^[<>@=]/                             { flush_rec() }
@@ -292,14 +297,27 @@ start_background_scan() {
   printf '%s' "$!"
 }
 
+# Capability matters here. With KeyboardDisplay (-c 4) this keyboard answers
+# with "User Confirm 000000 hint 1" and waits for an acknowledgement; btmgmt
+# run non-interactively has no way to give one, so the link drops and pairing
+# fails with status 0x03. NoInputNoOutput (-c 3) selects Just Works, which
+# needs no confirmation. Try that first and keep -c 4 as a fallback.
 pair_now() {
-  local addr="$1"
-  say "Pairing with $addr"
+  local addr="$1" cap
   # Clear anything pending, or the kernel answers Busy (0x0a).
   sudo -n btmgmt --index 0 cancelpair -t 2 "$addr" </dev/null >/dev/null 2>&1 || true
   sleep 1
-  sudo -n timeout 90 btmgmt --index 0 pair -t 2 -c 4 "$addr" </dev/null 2>&1 | tee -a "$LOG"
-  is_paired "$addr"
+  for cap in 3 4; do
+    say "Pairing with $addr (io-capability $cap)"
+    sudo -n timeout 60 btmgmt --index 0 pair -t 2 -c "$cap" "$addr" </dev/null 2>&1 \
+      | tee -a "$LOG"
+    if is_paired "$addr"; then
+      return 0
+    fi
+    sudo -n btmgmt --index 0 cancelpair -t 2 "$addr" </dev/null >/dev/null 2>&1 || true
+    sleep 1
+  done
+  return 1
 }
 
 is_paired() {
