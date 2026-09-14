@@ -268,8 +268,27 @@ is_discoverable_flags() {
 
 # An LE scan has to be running for advertising reports to reach the host at
 # all; btmon only observes what the controller already receives.
+#
+# Run it as repeated bounded bursts rather than one unbroken scan. A single
+# multi-minute scan keeps the CNVi radio saturated (it is shared with Wi-Fi),
+# and this machine hard-locked once with a 15-minute scan in flight. Nothing in
+# the logs tied the lockup to Bluetooth, but there is no reason to hold the
+# radio down continuously when short bursts detect an advertisement just as
+# well -- the keyboard advertises for tens of seconds.
+SCAN_BURST="${SCAN_BURST:-30}"
+SCAN_GAP="${SCAN_GAP:-2}"
+
 start_background_scan() {
-  timeout "$1" bluetoothctl --timeout "$1" scan on >/dev/null 2>&1 &
+  local total="$1"
+  (
+    local spent=0
+    while (( spent < total )); do
+      local burst=$(( total - spent < SCAN_BURST ? total - spent : SCAN_BURST ))
+      timeout "$burst" bluetoothctl --timeout "$burst" scan on >/dev/null 2>&1 || true
+      sleep "$SCAN_GAP"
+      spent=$(( spent + burst + SCAN_GAP ))
+    done
+  ) &
   printf '%s' "$!"
 }
 
