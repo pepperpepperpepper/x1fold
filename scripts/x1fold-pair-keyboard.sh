@@ -5,22 +5,32 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
+  x1fold-pair-keyboard.sh --watch            <-- use this one
+  x1fold-pair-keyboard.sh --check [ADDRESS]
   x1fold-pair-keyboard.sh [ADDRESS]
   x1fold-pair-keyboard.sh --restore
   x1fold-pair-keyboard.sh --list
 
 Pairs an additional Bluetooth keyboard without stranding you without input.
 
-With no ADDRESS the keyboard currently in pairing mode is auto-detected by HID
-keyboard appearance (0x03c1) / BlueZ icon, which avoids picking up the ambient
-BLE clutter (lights, wearables, speakers) that a bare scan returns.
+START HERE: run --watch, then hold the keyboard's Bluetooth button. It pairs
+by itself. You do not have to synchronize anything.
 
-The X1 Fold's AX211 holds several peripherals at once, so the first pairing
-attempt leaves the existing keyboard connected and you keep working input
-throughout. Only if that attempt fails is the existing keyboard disconnected
-for a retry, and it is reconnected afterwards either way.
+Why --watch exists: these keyboards advertise in pairing mode for well under a
+minute, and a scan-then-pair chain loses that race -- BlueZ is still building
+the device object when the keyboard goes quiet, so `bluetoothctl` reports
+"Device ... not available" even while the keyboard is plainly discoverable.
+--watch runs a continuous raw-HCI monitor and pairs via the kernel management
+interface the moment a keyboard advertises, which needs no scan cycle.
+
+See docs/BLUETOOTH_KEYBOARD_PAIRING.md for the full explanation, including why
+the GUI and every bluetoothctl recipe fail on this hardware.
 
 Options:
+  --watch     Watch continuously and auto-pair any keyboard that enters
+              pairing mode. Needs sudo (raw HCI). Ctrl-C to stop.
+  --check     Report whether a keyboard is advertising and whether it is in
+              real pairing mode or only reconnect mode. Needs sudo.
   --restore   Reconnect the previously connected keyboard and exit.
   --list      List connected/known keyboards and exit.
   -h, --help  Show this help.
@@ -30,13 +40,14 @@ Environment:
                    connected one). Needed only if auto-detection picks wrong.
   SCAN_SECS        Discovery window, default 25.
   PAIR_WINDOW      Seconds allowed to type a passkey, default 45.
+  WATCH_SECS       How long --watch runs before giving up, default 600.
   X1FOLD_PAIR_LOG  Log path, default ${XDG_CACHE_HOME:-~/.cache}/x1fold-pair-keyboard.log
 
 Notes:
-  - No root required; this talks to BlueZ over D-Bus as your user.
+  - --watch and --check need sudo; the other modes do not.
+  - Nothing here ever disconnects a keyboard that is already connected.
   - If the new keyboard asks for a passkey, it is printed to this terminal.
-    Type it on the NEW keyboard and press Enter. Run this from a real terminal
-    so you can see it.
+    Type it on the NEW keyboard and press Enter.
 EOF
 }
 
@@ -46,6 +57,8 @@ TARGET=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
+    --watch) MODE="watch"; shift ;;
+    --check) MODE="check"; shift ;;
     --restore) MODE="restore"; shift ;;
     --list) MODE="list"; shift ;;
     -*) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -68,6 +81,7 @@ fi
 
 SCAN_SECS="${SCAN_SECS:-25}"
 PAIR_WINDOW="${PAIR_WINDOW:-45}"
+WATCH_SECS="${WATCH_SECS:-600}"
 LOG="${X1FOLD_PAIR_LOG:-${XDG_CACHE_HOME:-$HOME/.cache}/x1fold-pair-keyboard.log}"
 mkdir -p "$(dirname "$LOG")"
 
@@ -109,6 +123,21 @@ input_nodes_for() {
     [[ "${uniq,,}" == "$mac" ]] || continue
     name="$(cat "$e/device/name" 2>/dev/null || true)"
     printf '      /dev/input/%s  %s\n' "$(basename "$e")" "$name"
+  done
+}
+
+# Two units of the same model produce identically-named input nodes, so show
+# which belongs to which -- this is what you need for per-keyboard keyd/hwdb
+# rules, and the mapping is not discoverable from the node names alone.
+report_input_nodes() {
+  local mac nodes
+  for mac in "${TARGET:-}" "${OLD_KBD:-}"; do
+    [[ -n "$mac" ]] || continue
+    is_connected "$mac" || continue
+    nodes="$(input_nodes_for "$mac")"
+    [[ -n "$nodes" ]] || continue
+    printf '    %s  %s\n' "$mac" "$(alias_of "$mac")"
+    printf '%s\n' "$nodes"
   done
 }
 
@@ -167,9 +196,205 @@ reconnect_old() {
   return 1
 }
 
+# --- raw HCI: the only view that shows these keyboards --------------------- #
+#
+# BlueZ discards advertisements whose Flags byte lacks a discoverable bit, so a
+# keyboard advertising to reconnect to an existing bond never becomes a device
+# object and `bluetoothctl pair` answers "not available". btmon sees every
+# packet the controller receives, before any of that filtering.
+#
+# Flags bits:  0x01 LE Limited Discoverable
+#              0x02 LE General Discoverable   <-- real pairing mode
+#              0x04 BR/EDR Not Supported
+# 0x06 = pairing mode.  0x04 = reconnect only, it will drop our link.
+
+need_hci_tools() {
+  command -v btmon >/dev/null 2>&1 || die "btmon not found (install bluez-utils)"
+  command -v btmgmt >/dev/null 2>&1 || die "btmgmt not found (install bluez-utils)"
+  sudo -n true 2>/dev/null || die "--$MODE needs sudo: btmon and btmgmt talk to the kernel directly"
+}
+
+# btmon prints a multi-line block per advertising report, and the fields we
+# need are spread across it (Address early, Name last), so accumulate and emit
+# when the next block starts. Emits: "ADDR FLAGS RSSI NAME" -- name last so a
+# plain `read` captures names containing spaces.
+ADV_FILTER='
+  function flush_rec() {
+      if (kbd && addr != "")
+          print addr, (flags == "" ? "0x00" : flags), rssi, (name == "" ? "-" : name)
+      kbd=0; addr=""; flags=""; rssi="?"; name=""
+  }
+  /^[<>@=]/                             { flush_rec() }
+  /^[[:space:]]*Address: [0-9A-F:]{17}/ { addr=$2 }
+  /^[[:space:]]*RSSI: /                 { rssi=$2 }
+  /Appearance: Keyboard/                { kbd=1 }
+  /^[[:space:]]*Flags: 0x/              { flags=$2 }
+  /^[[:space:]]*Name \(/ {
+      line=$0
+      sub(/^[[:space:]]*Name \([^)]*\): /, "", line)
+      name=line
+  }
+  END { flush_rec() }
+'
+
+# A neighbour'\''s keyboard can sit in pairing mode at the same time as yours --
+# that has been observed here, at a stronger RSSI than some of our own traffic.
+# Auto-pairing is therefore restricted to devices whose advertised name looks
+# like this hardware and whose signal is close. Pass an explicit ADDRESS to
+# --watch to bypass both checks.
+KBD_NAME_RE="${X1FOLD_KBD_NAME_RE:-ThinkPad|TrackPoint|X1F}"
+KBD_MIN_RSSI="${X1FOLD_KBD_MIN_RSSI:--75}"
+
+is_our_keyboard() {
+  local addr="$1" rssi="$2" name="$3"
+  # An explicitly requested address always wins.
+  if [[ -n "${TARGET:-}" ]]; then
+    [[ "${addr^^}" == "${TARGET^^}" ]]
+    return $?
+  fi
+  if [[ ! "$name" =~ $KBD_NAME_RE ]]; then
+    return 1
+  fi
+  if [[ "$rssi" =~ ^-?[0-9]+$ ]] && (( rssi < KBD_MIN_RSSI )); then
+    return 1
+  fi
+  return 0
+}
+
+is_discoverable_flags() {
+  local f=$(( $1 ))
+  (( (f & 0x03) != 0 ))
+}
+
+# An LE scan has to be running for advertising reports to reach the host at
+# all; btmon only observes what the controller already receives.
+start_background_scan() {
+  timeout "$1" bluetoothctl --timeout "$1" scan on >/dev/null 2>&1 &
+  printf '%s' "$!"
+}
+
+pair_now() {
+  local addr="$1"
+  say "Pairing with $addr"
+  # Clear anything pending, or the kernel answers Busy (0x0a).
+  sudo -n btmgmt --index 0 cancelpair -t 2 "$addr" </dev/null >/dev/null 2>&1 || true
+  sleep 1
+  sudo -n timeout 90 btmgmt --index 0 pair -t 2 -c 4 "$addr" </dev/null 2>&1 | tee -a "$LOG"
+  is_paired "$addr"
+}
+
+is_paired() {
+  bluetoothctl devices Paired 2>/dev/null | grep -qi "${1}"
+}
+
+cmd_check() {
+  need_hci_tools
+  local want="${1:-}"
+  local tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' RETURN
+
+  say "Listening ${SCAN_SECS}s for keyboard advertisements"
+  sudo -n timeout $((SCAN_SECS + 3)) btmon > "$tmp" 2>&1 &
+  local mon=$!
+  sleep 1
+  local sp; sp="$(start_background_scan "$SCAN_SECS")"
+  wait "$mon" 2>/dev/null || true
+  kill "$sp" 2>/dev/null || true
+
+  local found=0 rc=2 addr flags rssi name
+  while read -r addr flags rssi name; do
+    [[ -n "$want" && "${addr^^}" != "${want^^}" ]] && continue
+    found=1
+    if is_discoverable_flags "$flags"; then
+      printf '  %s  %-14s flags=%s RSSI=%-4s ==> PAIRING MODE, ready to pair\n' \
+        "$addr" "$name" "$flags" "$rssi"
+      rc=0
+    else
+      printf '  %s  %-14s flags=%s RSSI=%-4s ==> reconnect only (bonded elsewhere)\n' \
+        "$addr" "$name" "$flags" "$rssi"
+      [[ $rc -eq 0 ]] || rc=3
+    fi
+  done < <(awk "$ADV_FILTER" "$tmp" | sort -u)
+
+  if [[ $found -eq 0 ]]; then
+    echo "  no keyboard advertisements heard -- turn it on / hold its Bluetooth button"
+    return 2
+  fi
+  return $rc
+}
+
+cmd_watch() {
+  need_hci_tools
+  say "Watching up to ${WATCH_SECS}s for a keyboard to enter pairing mode."
+  say "Hold the new keyboard's Bluetooth button now -- pairing is automatic."
+  say "Your existing keyboard stays connected. Ctrl-C to stop."
+
+  local sp; sp="$(start_background_scan "$WATCH_SECS")"
+  # Re-arm the scan periodically; bluetoothctl's --timeout ends it.
+  trap 'kill "$sp" 2>/dev/null || true' EXIT
+
+  local addr flags rssi name
+  local -A tried=()
+  while read -r addr flags rssi name; do
+    [[ -n "$OLD_KBD" && "${addr^^}" == "${OLD_KBD^^}" ]] && continue
+    is_paired "$addr" && continue
+
+    if ! is_our_keyboard "$addr" "$rssi" "$name"; then
+      if [[ -z "${tried[$addr]:-}" ]]; then
+        tried[$addr]="foreign"
+        warn "Ignoring $addr ('$name', RSSI $rssi) -- not this hardware, or too far."
+        warn "If it IS yours: x1fold-pair-keyboard.sh --watch $addr"
+      fi
+      continue
+    fi
+
+    if ! is_discoverable_flags "$flags"; then
+      if [[ "${tried[$addr]:-}" != "seen" ]]; then
+        tried[$addr]="seen"
+        warn "$addr ('$name') is advertising to reconnect (flags=$flags), not pairing."
+        warn "Hold its Bluetooth button longer to clear the old bond."
+      fi
+      continue
+    fi
+
+    if [[ "${tried[$addr]:-}" == "pairing" ]]; then
+      continue
+    fi
+    tried[$addr]="pairing"
+
+    say "Keyboard in PAIRING MODE: $addr '$name' (flags=$flags, RSSI=$rssi)"
+    if pair_now "$addr"; then
+      say "Paired: $addr"
+      sudo -n btmgmt --index 0 pairable on </dev/null >/dev/null 2>&1 || true
+      bluetoothctl trust "$addr" >/dev/null 2>&1 || true
+      bluetoothctl connect "$addr" >/dev/null 2>&1 || true
+      sleep 3
+      say "Input nodes (matched by address -- the names are identical):"
+      TARGET="$addr"
+      report_input_nodes
+      say "Log: $LOG"
+      return 0
+    fi
+    warn "Pairing $addr failed; still watching."
+    tried[$addr]=""
+  done < <(sudo -n timeout "$WATCH_SECS" btmon 2>/dev/null | awk "$ADV_FILTER")
+
+  warn "Gave up after ${WATCH_SECS}s without a keyboard entering pairing mode."
+  return 1
+}
+
 OLD_KBD="$(detect_old_kbd)"
 
 case "$MODE" in
+  watch)
+    cmd_watch
+    exit $?
+    ;;
+  check)
+    cmd_check "$TARGET"
+    exit $?
+    ;;
   list)
     echo "Keyboards known to BlueZ:"
     list_keyboards
@@ -268,21 +493,6 @@ attempt_pair() {
 }
 
 : > "$LOG"
-
-# Two units of the same model produce identically-named input nodes, so show
-# which belongs to which -- this is what you need for per-keyboard keyd/hwdb
-# rules, and the mapping is not discoverable from the node names alone.
-report_input_nodes() {
-  local mac nodes
-  for mac in "$TARGET" "$OLD_KBD"; do
-    [[ -n "$mac" ]] || continue
-    is_connected "$mac" || continue
-    nodes="$(input_nodes_for "$mac")"
-    [[ -n "$nodes" ]] || continue
-    printf '    %s  %s\n' "$mac" "$(alias_of "$mac")"
-    printf '%s\n' "$nodes"
-  done
-}
 
 say "Attempt 1: pairing with the existing keyboard left connected"
 if attempt_pair no; then

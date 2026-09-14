@@ -110,21 +110,33 @@ peripherals at once, so both keyboards can stay connected and both feed the
 same seat — there is no need to unpair one to use the other.
 
 ```bash
-scripts/x1fold-pair-keyboard.sh            # auto-detect the keyboard in pairing mode
-scripts/x1fold-pair-keyboard.sh --list     # show keyboards known to BlueZ
+scripts/x1fold-pair-keyboard.sh --watch    # start here: hold the keyboard's BT button
+scripts/x1fold-pair-keyboard.sh --check    # is it advertising? in which mode?
+scripts/x1fold-pair-keyboard.sh --list     # show keyboards known to BlueZ + input nodes
 scripts/x1fold-pair-keyboard.sh --restore  # reconnect the previous keyboard
 ```
 
-Run it from a real terminal: if the new keyboard requires a passkey, it is
-printed there and must be typed on the *new* keyboard.
+**These keyboards do not pair through the normal Linux path.** The Bluetooth
+GUI won't show them, and `bluetoothctl pair` reports `Device ... not available`
+while the keyboard is actively advertising a few inches away. That is not a
+fault in the machine: the keyboard advertises with no discoverable bit set when
+it is already bonded to another host, and BlueZ drops such advertisements
+before they become device objects. A five-minute scan here catalogued 195
+devices without listing the keyboard, while raw HCI showed it the entire time.
 
-The script is written so a failed pairing can't leave you without input. It
-auto-detects the currently connected keyboard, tries to pair with that keyboard
-left connected, and only falls back to disconnecting it if the first attempt
-fails — reconnecting it afterwards either way. Candidates are filtered by HID
-keyboard appearance (`0x03c1`) / BlueZ icon so ambient BLE devices are not
-offered as targets, and if discovery finds nothing it exits before touching the
-existing connection.
+`--watch` sidesteps this by monitoring raw HCI and pairing through the kernel
+management interface, which needs no scan cycle and no D-Bus device object. It
+also removes the timing problem — pairing mode lasts under a minute, which a
+scan-then-pair sequence routinely loses. Start the watcher, then press the
+button whenever you like.
+
+**Read `docs/BLUETOOTH_KEYBOARD_PAIRING.md` before fighting this by hand.** It
+covers the flags, the per-host-slot addresses, and the diagnostic commands.
+
+Nothing in the script disconnects a keyboard that is already connected — the
+AX211 holds both at once, verified. `--watch` only auto-pairs devices whose
+advertised name and signal strength match this hardware, so a neighbour's
+keyboard in pairing mode is ignored; pass an explicit address to override.
 
 Note that `install_x1fold_fnctl.sh` is specific to the Lenovo keyboard's own HID
 report and does **not** apply to third-party Bluetooth keyboards; use `keyd` or
@@ -132,6 +144,8 @@ a udev hwdb entry for those.
 
 ### Documentation
 
+- `docs/BLUETOOTH_KEYBOARD_PAIRING.md`: why these keyboards don't pair through
+  the normal Linux path, and how to pair them anyway.
 - `docs/ACPI_STATUS.md`: ACPI namespace notes and signal discovery.
 - `docs/linux_halfblank_plan.md`: design/architecture (including Wayland direction).
 - `docs/WINDOWS_REPORT.md`: Windows-side telemetry relevant to the behavior.
