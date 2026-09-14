@@ -42,6 +42,10 @@ Options:
                      pairing mode. Needs sudo (raw HCI). Ctrl-C to stop.
   --check            Report whether a keyboard is advertising and whether it is
                      in real pairing mode or only reconnect mode. Needs sudo.
+  --selftest         Check tools, privileges, adapter and the advertisement
+                     parser against a recorded fixture. Run this first if
+                     --watch "does nothing" -- every failure mode found here
+                     was silent.
   --backup-bonds F   Save this adapter's pairing keys to F (mode 0600).
   --restore-bonds F  Restore pairing keys from F and restart bluetooth.
   --restore          Reconnect the previously connected keyboard and exit.
@@ -73,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     -h|--help) usage; exit 0 ;;
     --watch) MODE="watch"; shift ;;
     --check) MODE="check"; shift ;;
+    --selftest) MODE="selftest"; shift ;;
     --backup-bonds)
       MODE="backup-bonds"
       [[ $# -ge 2 ]] || { echo "--backup-bonds needs a file path" >&2; exit 2; }
@@ -176,6 +181,9 @@ list_keyboards() {
       [[ "$state" == "connected" ]] && input_nodes_for "$mac"
     fi
   done < <(bluetoothctl devices 2>/dev/null || true)
+  # Without this the function inherits the status of the last conditional
+  # above, so --list exits 1 whenever the last keyboard listed is offline.
+  return 0
 }
 
 # The keyboard to protect: an explicit override, else whichever keyboard is
@@ -614,9 +622,136 @@ cmd_restore_bonds() {
   say "Turn the keyboards on; they should reconnect without pairing."
 }
 
+# --- self test -------------------------------------------------------------- #
+#
+# Every bug that cost real time here failed *silently*: the watcher printed its
+# banner and did nothing, twice, because btmon was never started. You only find
+# that out while standing there holding a button. This checks the whole chain
+# against a recorded fixture so breakage surfaces before you need it.
+
+SELFTEST_FIXTURE='> HCI Event: LE Meta Event (0x3e) plen 43
+      LE Extended Advertising Report (0x0d)
+          Address type: Random (0x01)
+          Address: C0:FF:EE:00:00:23 (Static)
+          RSSI: -59 dBm (0xc5)
+        Advertising Data[31]:
+        Appearance: Keyboard (0x03c1)
+        Flags: 0x06
+          LE General Discoverable Mode
+        16-bit Service UUIDs (complete): 1 entry
+          Human Interface Device (0x1812)
+        Name (short): X1FKeyboard
+> HCI Event: LE Meta Event (0x3e) plen 43
+      LE Extended Advertising Report (0x0d)
+          Address type: Random (0x01)
+          Address: C0:FF:EE:00:00:22 (Static)
+          RSSI: -67 dBm (0xbd)
+        Advertising Data[24]:
+        Appearance: Keyboard (0x03c1)
+        Flags: 0x04
+          BR/EDR Not Supported
+        Name (short): ThinkPad Bl
+> HCI Event: LE Meta Event (0x3e) plen 20
+          Address: C0:FF:EE:00:00:99 (Static)
+          RSSI: -40 dBm (0xd8)
+        Flags: 0x06
+        Name (complete): Govee_H6076_ABCD
+@ MGMT Event: end'
+
+cmd_selftest() {
+  local fails=0
+  check() {
+    local what="$1" ok="$2"
+    if [[ "$ok" == "ok" ]]; then
+      printf '  \033[0;32mPASS\033[0m  %s\n' "$what"
+    else
+      printf '  \033[0;31mFAIL\033[0m  %s\n' "$what"
+      fails=$((fails + 1))
+    fi
+  }
+
+  echo "Dependencies:"
+  local t
+  for t in bluetoothctl btmon btmgmt awk tail mkfifo; do
+    check "$t present" "$(command -v "$t" >/dev/null 2>&1 && echo ok || echo no)"
+  done
+
+  echo "Privileges:"
+  check "sudo -n works (needed by --watch/--check)" \
+    "$(sudo -n true 2>/dev/null && echo ok || echo no)"
+  check "btmon can actually start" \
+    "$(sudo -n timeout 2 btmon >/dev/null 2>&1; [[ $? -eq 124 || $? -eq 0 ]] && echo ok || echo no)"
+
+  echo "Adapter:"
+  local adapter; adapter="$(adapter_addr)"
+  check "controller present${adapter:+ ($adapter)}" "$([[ -n "$adapter" ]] && echo ok || echo no)"
+  check "controller powered" \
+    "$(bluetoothctl show 2>/dev/null | grep -q 'Powered: yes' && echo ok || echo no)"
+
+  echo "Advertisement parser:"
+  local parsed
+  parsed="$(printf '%s\n' "$SELFTEST_FIXTURE" | awk "$ADV_FILTER")"
+  check "extracts the pairing-mode keyboard" \
+    "$(grep -q 'C0:FF:EE:00:00:23 0x06 -59 X1FKeyboard' <<<"$parsed" && echo ok || echo no)"
+  check "extracts the reconnect-mode keyboard" \
+    "$(grep -q 'C0:FF:EE:00:00:22 0x04 -67 ThinkPad Bl' <<<"$parsed" && echo ok || echo no)"
+  check "ignores non-keyboard advertisers" \
+    "$(grep -qv 'Govee' <<<"$parsed" && ! grep -q 'Govee' <<<"$parsed" && echo ok || echo no)"
+
+  echo "Flag interpretation:"
+  check "0x06 is pairing mode"      "$(is_discoverable_flags 0x06 && echo ok || echo no)"
+  check "0x04 is NOT pairing mode"  "$(is_discoverable_flags 0x04 && echo no || echo ok)"
+
+  echo "Target filter:"
+  local saved="${TARGET:-}"; TARGET=""
+  check "accepts this hardware"        "$(is_our_keyboard C0:FF:EE:00:00:23 -59 X1FKeyboard && echo ok || echo no)"
+  check "rejects a foreign keyboard"   "$(is_our_keyboard AA:BB:CC:DD:EE:FF -40 'Magic Keyboard' && echo no || echo ok)"
+  check "rejects a distant keyboard"   "$(is_our_keyboard C0:FF:EE:00:00:23 -95 X1FKeyboard && echo no || echo ok)"
+  TARGET="$saved"
+
+  echo "Streaming (the bug that made --watch a silent no-op):"
+  # Feed the parser and HOLD THE PIPE OPEN. awk flushes at EOF regardless, so a
+  # finite fixture passes even with fflush() missing -- exactly the bug that
+  # made the watcher silently useless. The real question is whether a record
+  # appears *before* the input ends.
+  #
+  # Everything is backgrounded and polled rather than captured in a command
+  # substitution: $( ) waits for the whole pipeline, so a block-buffering awk
+  # made this check hang instead of fail.
+  local sout="${LOG}.selftest"
+  rm -f "$sout"
+  ( { printf '%s\n' "$SELFTEST_FIXTURE"; sleep 6; } \
+      | awk "$ADV_FILTER" > "$sout" 2>/dev/null ) &
+  local spid=$!
+  local waited=0
+  while [[ $waited -lt 3 ]] && [[ ! -s "$sout" ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  local streamed="no"
+  [[ -s "$sout" ]] && streamed="ok"
+  kill "$spid" 2>/dev/null || true
+  wait "$spid" 2>/dev/null || true
+  rm -f "$sout"
+  check "parser emits before EOF (block-buffering makes --watch a silent no-op)" \
+    "$streamed"
+
+  echo
+  if [[ $fails -eq 0 ]]; then
+    say "All checks passed. --watch should work."
+    return 0
+  fi
+  warn "$fails check(s) failed -- fix these before relying on --watch."
+  return 1
+}
+
 OLD_KBD="$(detect_old_kbd)"
 
 case "$MODE" in
+  selftest)
+    cmd_selftest
+    exit $?
+    ;;
   backup-bonds)
     cmd_backup_bonds "$BOND_FILE"
     exit $?

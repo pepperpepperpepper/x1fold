@@ -33,7 +33,7 @@ Pairing completes **only when Enter is pressed on the keyboard itself.**
 When pairing starts, the kernel emits:
 
 ```
-hci0 E6:DE:D6:52:04:C2 User Confirm 000000 hint 1
+hci0 C0:FF:EE:00:00:23 User Confirm 000000 hint 1
 ```
 
 That reads like a dialog on the computer waiting to be clicked. **It is not.**
@@ -68,6 +68,23 @@ Only `DisplayOnly` (`-c 0`) negotiates the method this keyboard accepts.
 
 Override with `X1FOLD_PAIR_CAP` if a different unit needs something else.
 
+## If `--watch` seems to do nothing
+
+Run the self test first. Every failure mode this tooling has had was *silent* —
+the watcher printed its banner, looked healthy, and never saw a single
+advertisement. The self test checks the whole chain against a recorded fixture,
+including the parser-buffering bug that caused exactly that:
+
+```bash
+x1fold-pair-keyboard --selftest
+```
+
+It verifies the tools exist, `sudo -n` works, `btmon` can actually start, the
+adapter is powered, the advertisement parser extracts both pairing-mode and
+reconnect-mode records, the flag logic is right, foreign keyboards are rejected,
+and — importantly — that the parser emits records *before* its input ends.
+Nothing here needs a keyboard present.
+
 To see what the keyboard is currently doing without pairing:
 
 ```bash
@@ -75,7 +92,7 @@ x1fold-pair-keyboard.sh --check
 ```
 
 ```
-E6:DE:D6:52:04:C2  X1FKeyboard    flags=0x06 RSSI=-59  ==> PAIRING MODE, ready to pair
+C0:FF:EE:00:00:23  X1FKeyboard    flags=0x06 RSSI=-59  ==> PAIRING MODE, ready to pair
 ```
 
 ## Never do this again: back up the pairing keys
@@ -159,7 +176,7 @@ drops you:
 
 ```
 Status: Connection Failed to be Established (0x3e)
-Handle: 2049 (LE-ACL) Address: E6:DE:D6:52:03:C2 (Static)
+Handle: 2049 (LE-ACL) Address: C0:FF:EE:00:00:22 (Static)
 Features[0/0][8]: 00 00 00 00 00 00 00 00
 ```
 
@@ -192,8 +209,8 @@ different advertised name**:
 
 | Slot | Address | Name | Observed flags |
 | --- | --- | --- | --- |
-| previously bonded | `E6:DE:D6:52:03:C2` | `ThinkPad Bl…` | `0x04` |
-| free slot | `E6:DE:D6:52:**04**:C2` | `X1FKeyboard` | `0x06` |
+| previously bonded | `C0:FF:EE:00:00:22` | `ThinkPad Bl…` | `0x04` |
+| free slot | `C0:FF:EE:00:00:**23**` | `X1FKeyboard` | `0x06` |
 
 Note the single-octet difference. Holding the Bluetooth button moves between
 slots, so **the address changes** — do not assume the address you saw earlier is
@@ -206,8 +223,8 @@ The X1 Fold's Intel AX211 holds both keyboards simultaneously. This is verified,
 not theoretical — both appear as connected in the same management trace:
 
 ```
-hci0 C6:45:40:B5:83:91 type LE Random connected
-hci0 E6:DE:D6:52:04:C2 type LE Random connected
+hci0 C0:FF:EE:00:00:11 type LE Random connected
+hci0 C0:FF:EE:00:00:23 type LE Random connected
 ```
 
 Nothing in `x1fold-pair-keyboard.sh` disconnects an already-connected keyboard.
@@ -224,7 +241,7 @@ x1fold-pair-keyboard.sh --list
 ```
 
 ```
-C6:45:40:B5:83:91  connected   ThinkPad Bluetooth TrackPoint Keyboard
+C0:FF:EE:00:00:11  connected   ThinkPad Bluetooth TrackPoint Keyboard
     /dev/input/event15  ThinkPad Bluetooth TrackPoint Keyboard
     /dev/input/event16  ThinkPad Bluetooth TrackPoint Keyboard Mouse
     /dev/input/event17  ThinkPad Bluetooth TrackPoint Keyboard
@@ -248,7 +265,7 @@ and whose signal is close:
 Passing an explicit address bypasses both:
 
 ```bash
-x1fold-pair-keyboard.sh --watch E6:DE:D6:52:04:C2
+x1fold-pair-keyboard.sh --watch C0:FF:EE:00:00:23
 ```
 
 ## Manual diagnosis
@@ -279,6 +296,7 @@ sudo btmgmt --index 0 cancelpair -t 2 <ADDRESS>
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | **`status 0x03 (Failed)` after it connects** | **Nobody pressed Enter on the keyboard** | **Press Enter on the NEW keyboard when prompted** |
+| `--watch` prints its banner then nothing | Tooling problem, not the keyboard | `x1fold-pair-keyboard --selftest` |
 | `Remote User Terminated Connection (0x13)` | Same — the keyboard gave up waiting | Same |
 | "Connection request" notification vanishes | Sway has no agent that can hold the dialog | Ignore it; the answer is Enter on the keyboard, not a click |
 | `Device ... not available` | Advertising with flags `0x04`, filtered by BlueZ | Hold the Bluetooth button until it reaches pairing mode; use `--watch` |
