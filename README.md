@@ -39,6 +39,7 @@ This mirrors how the platform behaves under Windows: the “halfblank” effect 
   - `install_x1fold_halfblank.sh`: installs binaries + systemd units.
   - `install_x1fold_fnctl.sh`: installs `x1fold-fnctl` and its persistence hooks for the keyboard-side Fn/Ctrl swap.
   - `install_x1fold_webcam.sh`: installs webcam helpers + optional OVTI5675 `ipu_bridge` DKMS override.
+  - `install_x1fold_sleep.sh`: installs the lid/power sleep policy + the `button.lid_init_state=open` cmdline fix (see below).
   - `x1fold-halfblank-ui-session.sh`: wrapper to run the UI helper inside the active Wayland session (exports `WAYLAND_DISPLAY`/`SWAYSOCK`).
   - `halfblank_switch.sh`: wrapper for `half|full|status`.
   - `halfblank_regression.sh`: on-device loop test with logs.
@@ -48,6 +49,7 @@ This mirrors how the platform behaves under Windows: the “halfblank” effect 
   - `x1fold-halfblankd.service`: system daemon unit.
   - `x1fold-tty-rotate.service`: system daemon unit for fbcon auto-rotate.
   - `user/x1fold-halfblank-ui.service`: per-user UI helper unit.
+  - `logind.conf.d/`: lid + power-key sleep policy (hibernate on both).
 
 ### Install (live system)
 
@@ -67,6 +69,41 @@ Enable the per-user UI helper (run as the desktop user):
 ```bash
 systemctl --user enable --now x1fold-halfblank-ui.service
 ```
+
+### Sleep / lid policy install
+
+Run as root:
+
+```bash
+x1fold/scripts/install_x1fold_sleep.sh
+```
+
+This installs the logind drop-ins (`HandleLidSwitch=hibernate`,
+`HandlePowerKey=hibernate` — the X1 Fold is s2idle-only, so S4 is the only cold
+sleep available) and appends `button.lid_init_state=open` to the systemd-boot
+kernel cmdline. Use `--dry-run` to preview, `--no-cmdline` to skip the
+bootloader.
+
+**The cmdline argument is not optional.** `button.lid_init_state` defaults to
+`method`, which makes the ACPI button driver re-evaluate `_LID` on resume; on
+this machine it returns *closed*. logind ignores lid input for
+`HoldoffTimeoutSec` (30s) after resume, then re-reads the switch state directly,
+sees "closed", and applies `HandleLidSwitch` again. The result is that the
+machine hibernates itself roughly 23–26s after you open the lid, with no
+`Lid closed.` line in the journal — right as resume finishes, so it reads as
+"it woke up and then died again". Setting `open` only changes the synthetic
+state reported at driver init/resume; real fold/unfold notifications still work.
+
+To check for the symptom in your own journal:
+
+```bash
+journalctl -o short-unix | grep -E "hibernation (entry|exit)" | awk \
+  '{ts=$1; sub(/\..*/,"",ts);
+     if ($0 ~ /exit/) e=ts;
+     else if (e && ts-e < 120) print "re-slept " (ts-e) "s after resume at " strftime("%F %T", e) }'
+```
+
+A cluster of re-sleeps at +22–26s is this bug.
 
 ### Webcam install (IPU6 / OVTI5675)
 

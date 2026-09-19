@@ -1,16 +1,26 @@
 #!/bin/sh
 set -eu
 
-# Prevent spurious wakeups on the ThinkPad X1 Fold when the lid is closed.
+# Prevent spurious wakeups on the ThinkPad X1 Fold while suspended.
 #
 # Symptom:
-#   Close lid → system suspends (s2idle) correctly, but tilting/moving the
-#   machine wakes it up again (likely from accelerometer / Intel HID events).
+#   System suspends (s2idle) correctly, but tilting/moving the machine wakes it
+#   up again (likely from accelerometer / Intel HID events).
 #
 # Fix:
 #   Disable wakeup on the Intel HID events platform device (INTC1070:00) before
 #   entering sleep. This does *not* disable the device while awake; it only
 #   prevents it from waking the system.
+#
+# Scope:
+# - This matters for s2idle only. Lid close is policy-bound to *hibernate* (see
+#   systemd/logind.conf.d/20-x1fold-lid-hibernate.conf), and in S4 the platform
+#   is powered off, so INTC1070 wakeup is irrelevant there. The guard still
+#   covers non-lid suspends (idle, `systemctl suspend`).
+# - The guard is one-way by design: `post` re-disables rather than restoring,
+#   in case the driver re-enabled wakeup during resume. INTC1070 wake therefore
+#   stays disabled for the rest of the boot once the machine has slept once.
+#   Run `... enable` to put it back, `... status` to check.
 #
 # Notes:
 # - Keep this conservative: we only touch INTC1070 by default. If you also want

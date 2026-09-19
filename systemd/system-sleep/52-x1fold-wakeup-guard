@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
 
-# Prevent lid-closed motion (accelerometer/Intel HID) from waking the system.
+# Prevent motion (accelerometer/Intel HID) from waking the system while it is
+# suspended. Relevant to s2idle only -- lid close hibernates (see
+# systemd/logind.conf.d/20-x1fold-lid-hibernate.conf).
 # See: /usr/local/bin/x1fold-wakeup-guard
 
 case "${1:-}" in
