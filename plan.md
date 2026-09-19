@@ -387,14 +387,25 @@ Reference: `power_plan.md` contains the detailed, measured tuning notes for this
 Goal: keep fold/dock behavior, and use OLED-black regions to save watts.
 
 After the native install is booted:
-- Install halfblank tooling from this repo:
-  - `x1fold/scripts/install_x1fold_halfblank.sh --enable-system`
+- Install everything from this repo in one go:
+  - `x1fold/scripts/install_x1fold_all.sh`
+  - This runs the halfblank, Fn/Ctrl and sleep/lid installers, then prints the
+    follow-ups below. Add `--webcam` for the IPU6 stack (opt-in: builds DKMS).
+  - (The per-subsystem installers still work on their own — see the README.)
+- Follow-ups it cannot do for you:
+  - Sway lid snippet, as your desktop user (**not** root):
+    - `x1fold/scripts/install_x1fold_sway.sh --reload`
   - Enable UI helper (starts on user login):
     - Global: `systemctl --global enable x1fold-halfblank-ui.service`
     - (Alternative) Per-user: `systemctl --user enable --now x1fold-halfblank-ui.service`
+  - **Reboot**, then confirm the kernel cmdline took:
+    - `grep -o 'button.lid_init_state=[a-z]*' /proc/cmdline` → `open`
+    - Without it, lid-close hibernate re-sleeps ~25s after every resume.
 - Validate:
   - Dock → switches to half mode.
   - Bottom region is **actually black** (OLED power win).
+  - Close lid → hibernates; open → stays awake past the first minute.
+  - `x1fold-stay-awake -- sleep 60` → lid close does nothing while it runs.
 
 Docs:
 - Halfblank design/architecture: `docs/linux_halfblank_plan.md`

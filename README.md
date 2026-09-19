@@ -39,7 +39,10 @@ This mirrors how the platform behaves under Windows: the “halfblank” effect 
   - `install_x1fold_halfblank.sh`: installs binaries + systemd units.
   - `install_x1fold_fnctl.sh`: installs `x1fold-fnctl` and its persistence hooks for the keyboard-side Fn/Ctrl swap.
   - `install_x1fold_webcam.sh`: installs webcam helpers + optional OVTI5675 `ipu_bridge` DKMS override.
+  - `install_x1fold_all.sh`: runs the per-subsystem installers in order (start here on a fresh machine).
   - `install_x1fold_sleep.sh`: installs the lid/power sleep policy + the `button.lid_init_state=open` cmdline fix (see below).
+  - `install_x1fold_sway.sh`: installs the Sway lid snippet into `~/.config/sway/` (run as your user, not root).
+  - `x1fold-stay-awake`: hold a `handle-lid-switch` inhibitor so the Fold stays up while folded shut.
   - `x1fold-halfblank-ui-session.sh`: wrapper to run the UI helper inside the active Wayland session (exports `WAYLAND_DISPLAY`/`SWAYSOCK`).
   - `halfblank_switch.sh`: wrapper for `half|full|status`.
   - `halfblank_regression.sh`: on-device loop test with logs.
@@ -50,8 +53,23 @@ This mirrors how the platform behaves under Windows: the “halfblank” effect 
   - `x1fold-tty-rotate.service`: system daemon unit for fbcon auto-rotate.
   - `user/x1fold-halfblank-ui.service`: per-user UI helper unit.
   - `logind.conf.d/`: lid + power-key sleep policy (hibernate on both).
+- `upower/UPower.conf.d/`: critical-battery thresholds (drop-in, not an edit of `UPower.conf`).
+- `sway/x1fold.conf`: Sway snippet — blanks the internal panel when the fold closes.
 
 ### Install (live system)
+
+On a fresh machine, start here:
+
+```bash
+x1fold/scripts/install_x1fold_all.sh
+```
+
+That runs the halfblank, Fn/Ctrl and sleep installers in order, then prints the
+three things it cannot do for you: the Sway snippet (user scope), the per-user
+UI unit, and a reboot to pick up the kernel cmdline. Add `--webcam` to include
+the IPU6 stack (opt-in — it builds a DKMS module). `--dry-run` to preview.
+
+The per-subsystem installers below remain usable on their own for updates.
 
 Run as root:
 
@@ -104,6 +122,55 @@ journalctl -o short-unix | grep -E "hibernation (entry|exit)" | awk \
 ```
 
 A cluster of re-sleeps at +22–26s is this bug.
+
+The installer also drops in `upower/UPower.conf.d/10-x1fold-battery-action.conf`,
+which moves the critical-battery thresholds off the stock
+`PercentageCritical=5` / `PercentageAction=2`. Two percent is thin on this
+machine, and it matters more once you start holding the lid inhibitor below.
+
+### Staying awake with the lid closed
+
+To leave something running while the Fold is shut — a server, a long build:
+
+```bash
+x1fold-stay-awake -- ./my-server      # lock lives as long as the command
+x1fold-stay-awake                     # hold until Ctrl-C
+```
+
+For a systemd unit, wrap `ExecStart` the same way:
+
+```ini
+ExecStart=/usr/local/bin/x1fold-stay-awake -- /usr/local/bin/my-server
+```
+
+**Do not reach for `systemd-inhibit --what=sleep` here — it silently does
+nothing.** `20-x1fold-lid-hibernate.conf` sets `LidSwitchIgnoreInhibited=yes`
+(also the systemd default), and per `logind.conf(5)` that makes lid handling
+ignore the high-level locks (`shutdown`, `reboot`, `sleep`, `idle`). The lock
+registers, `systemd-inhibit --list` shows it, and the machine hibernates on lid
+close anyway. `handle-lid-switch` is a *low-level* lock, and those are "always
+honored, irrespective of this setting." That's the whole reason
+`x1fold-stay-awake` exists rather than a shell alias.
+
+Two things to know:
+
+- It suppresses logind's lid handling **entirely**, not just the hibernate
+  action — while held, lid close does nothing at all. The machine stays up
+  until the command exits; the backstop is UPower's critical-battery action.
+- The screen still blanks, because `sway/x1fold.conf` binds the switch in the
+  compositor via `bindswitch`, which reads libinput directly and is unaffected
+  by the inhibitor.
+
+Install the Sway side as your desktop user (**not** under sudo — it writes into
+`$HOME`, and the script refuses root):
+
+```bash
+x1fold/scripts/install_x1fold_sway.sh --reload
+```
+
+It writes `~/.config/sway/x1fold.conf` and adds one `include` to your config.
+That file is repo-managed and overwritten on reinstall; hand edits belong in
+`~/.config/sway/config.user`, which this repo never touches.
 
 ### Webcam install (IPU6 / OVTI5675)
 

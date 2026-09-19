@@ -1,0 +1,80 @@
+#!/bin/sh
+# Repo source: x1fold/scripts/x1fold-stay-awake
+set -eu
+
+# Keep the X1 Fold awake with the lid closed -- e.g. to leave a server running
+# while it is folded shut.
+#
+# Usage:
+#   x1fold-stay-awake -- <command> [args...]   hold the lock for that command
+#   x1fold-stay-awake                          hold until Ctrl-C
+#
+# Why --what=handle-lid-switch and not the obvious --what=sleep:
+#
+#   systemd/logind.conf.d/20-x1fold-lid-hibernate.conf sets
+#   LidSwitchIgnoreInhibited=yes (which is also the systemd default). Per
+#   logind.conf(5), that makes lid handling ignore the *high-level* locks --
+#   "shutdown", "reboot", "sleep", "idle". So `systemd-inhibit --what=sleep`
+#   registers fine and then the machine hibernates on lid close anyway, with
+#   no error. The failure mode is silent.
+#
+#   "handle-lid-switch" is a *low-level* lock, and those are, quoting the same
+#   man page, "always honored, irrespective of this setting."
+#
+# Caveat: this suppresses logind's lid handling entirely, not just the hibernate
+# action. While the lock is held the machine will not sleep on lid close at all,
+# so it stays up until the command exits. The backstop is UPower's
+# critical-battery action (see upower/UPower.conf.d/10-x1fold-battery-action.conf).
+#
+# Screen blanking is independent and still works -- see sway/x1fold.conf.
+
+WHY="${X1FOLD_STAY_AWAKE_WHY:-keeping the Fold awake with the lid closed}"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  x1fold-stay-awake -- <command> [args...]   hold the lock for that command
+  x1fold-stay-awake                          hold until Ctrl-C
+
+Keeps the X1 Fold awake with the lid closed -- e.g. to leave a server running
+while it is folded shut. The lock lives exactly as long as the command does.
+
+Note this suppresses logind's lid handling entirely, not just the hibernate
+action: while held, the machine will not sleep on lid close at all. The
+backstop is UPower's critical-battery action. Screen blanking is independent
+and still works (sway/x1fold.conf).
+
+Environment:
+  X1FOLD_STAY_AWAKE_WHY   reason string shown in `systemd-inhibit --list`
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  --)
+    shift
+    ;;
+esac
+
+if ! command -v systemd-inhibit >/dev/null 2>&1; then
+  echo "x1fold-stay-awake: systemd-inhibit not found" >&2
+  exit 1
+fi
+
+if [ "$#" -eq 0 ]; then
+  echo "x1fold-stay-awake: holding handle-lid-switch lock; Ctrl-C to release" >&2
+  exec systemd-inhibit \
+    --what=handle-lid-switch \
+    --who="x1fold-stay-awake" \
+    --why="$WHY" \
+    sleep infinity
+fi
+
+exec systemd-inhibit \
+  --what=handle-lid-switch \
+  --who="x1fold-stay-awake" \
+  --why="$WHY" \
+  -- "$@"
