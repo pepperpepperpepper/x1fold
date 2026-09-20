@@ -116,6 +116,45 @@ Concrete first pass (on `:2023`):
 - Reboot or restart the session to pick up the new compositor binary (first bring-up is easier with a reboot).
   - After it works, ensure dock/undock toggling does **not** require restart.
 
+## Status (2026-09-20)
+
+Implemented and rebased onto **sway 1.12 / wlroots 0.20.2**:
+- `patches/sway-1.12-x1fold-halfblank.patch`
+- `patches/wlroots0.20-x1fold-active-height.patch`
+- built + installed by `scripts/build_x1fold_sway.sh`
+
+The shipped implementation is closest to **Option A**, not Option B: it shrinks
+`wlr_output->{width,height}` (the *logical* output size) and lets the DRM primary
+plane cover only that region, leaving the rest of the CRTC unlit. It does **not**
+explicitly program `CRTC_H`/`CRTC_Y`, and it does not implement a separate pointer
+clamp — the pointer is confined as a consequence of the output being shorter.
+
+Rebase notes (0.19 → 0.20), in case this has to be redone:
+- `enum wlr_output_state_field` was renumbered; 0.20 already uses `1 << 13` for
+  `WLR_OUTPUT_STATE_IMAGE_DESCRIPTION`, so the x1fold bit moved to `1 << 14`.
+  **This is the one that silently corrupts state if you get it wrong.**
+- `output_compare_state()` gained a `COLOR_TRANSFORM` block; the x1fold block goes
+  after it.
+- `ext_image_capture_source_v1` now also tests `WLR_OUTPUT_STATE_ENABLED`.
+- sway's `queue_output_config()` gained HDR/color-profile handling at the tail;
+  the x1fold call goes after `set_hdr()`.
+
+Verified nested (`WLR_BACKENDS=wayland`, eDP guard temporarily relaxed to exercise
+the mechanism off-panel):
+
+| step | logical output height | fullscreen window rect |
+|---|---|---|
+| baseline | 588 | — |
+| `x1fold_halfblank enable 360` | 360 | `h=360` (constrained) |
+| `x1fold_halfblank disable` | 588 | `h=588` (follows back) |
+
+On stock sway the same fullscreen window reports the full output height — that is
+the bug this exists to fix. Invalid arguments and non-`eDP` outputs are rejected.
+
+Not yet verified on the real panel: nested backends have a synthetic mode, so the
+DRM behaviour (scanout stays 2024x2560 while the logical output is 2024x1240)
+still needs confirming on hardware against the checklist below.
+
 ## Validation checklist
 Docked (half):
 - Pointer cannot enter the bottom region (try touchpad + touchscreen).

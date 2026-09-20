@@ -42,6 +42,7 @@ This mirrors how the platform behaves under Windows: the “halfblank” effect 
   - `install_x1fold_all.sh`: runs the per-subsystem installers in order (start here on a fresh machine).
   - `install_x1fold_sleep.sh`: installs the lid/power sleep policy + the `button.lid_init_state=open` cmdline fix (see below).
   - `install_x1fold_sway.sh`: installs the Sway lid snippet into `~/.config/sway/` (run as your user, not root).
+  - `build_x1fold_sway.sh`: builds + installs the patched Sway that makes fullscreen respect halfblank (see below).
   - `x1fold-stay-awake`: hold a `handle-lid-switch` inhibitor so the Fold stays up while folded shut.
   - `x1fold-halfblank-ui-session.sh`: wrapper to run the UI helper inside the active Wayland session (exports `WAYLAND_DISPLAY`/`SWAYSOCK`).
   - `halfblank_switch.sh`: wrapper for `half|full|status`.
@@ -182,11 +183,55 @@ x1fold/scripts/install_x1fold_webcam.sh
 
 Details and troubleshooting are documented in `x1fold/webcam/README.md`.
 
-### Wayland “true shorter output” (optional, recommended for wlroots/Sway)
+### Wayland “true shorter output” (recommended for wlroots/Sway)
 
-If you want the bottom region to be *completely absent* from the Wayland desktop (no pointer, no window placement, no fullscreen fighting), apply the compositor-native crop patches:
-- `patches/wlroots0.19-x1fold-active-height.patch`
-- `patches/sway-1.11-x1fold-halfblank.patch`
+Without this, **fullscreen breaks halfblank**: the layer-shell fallback
+(`x1fold_wl_blank`) reserves the bottom region with an *exclusive zone*, which
+constrains tiled and floating windows — but fullscreen deliberately ignores
+exclusive zones, since covering the whole output is the entire point of
+fullscreen. So a fullscreen video spans the full 2560px panel and half of it
+lands under the keyboard. Only the compositor can make the bottom region
+genuinely not part of the desktop.
+
+Build and install a patched Sway:
+
+```bash
+x1fold/scripts/build_x1fold_sway.sh
+```
+
+This clones Sway 1.12 and wlroots 0.20.2, applies:
+- `patches/wlroots0.20-x1fold-active-height.patch` — adds
+  `WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT`, which shrinks the output's *logical*
+  height while leaving the scanout mode alone
+- `patches/sway-1.12-x1fold-halfblank.patch` — adds
+  `output <name> x1fold_halfblank enable <px> | disable`, restricted to the
+  internal panel (`eDP*`)
+
+and builds wlroots as a **static** meson subproject, so the result is a single
+self-contained binary at `/usr/local/bin/sway`. Nothing system-wide is replaced:
+the distro `sway` stays at `/usr/bin/sway` and the distro `wlroots` is untouched,
+so other wlroots-based programs are unaffected. `x1fold-sway-session` sets
+`PATH=/usr/local/sbin:/usr/local/bin:/usr/bin` before `exec sway`, so the patched
+build wins on next login.
+
+Roll back at any time — the distro package applies again on next login:
+
+```bash
+x1fold/scripts/build_x1fold_sway.sh --uninstall
+```
+
+No configuration change is needed: `x1fold_halfblank_ui.py` in `auto` mode probes
+for the command and selects `sway_crop` when it is present, `layer_shell` when it
+is not.
+
+Verify:
+
+```bash
+sway --version                                    # expect "branch 'x1fold'"
+swaymsg -t get_outputs | jq '.[].rect.height'     # 1240 docked, 2560 undocked
+```
+
+The older `sway-1.11` / `wlroots0.19` patches are kept for reference.
 
 See: `docs/sway_wlroots_halfblank_patch_plan.md`.
 

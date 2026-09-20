@@ -1,0 +1,233 @@
+diff --git a/include/wlr/interfaces/wlr_output.h b/include/wlr/interfaces/wlr_output.h
+index 6da2c2c..2bf8b3d 100644
+--- a/include/wlr/interfaces/wlr_output.h
++++ b/include/wlr/interfaces/wlr_output.h
+@@ -21,6 +21,7 @@
+ 	(WLR_OUTPUT_STATE_DAMAGE | \
+ 	WLR_OUTPUT_STATE_SCALE | \
+ 	WLR_OUTPUT_STATE_TRANSFORM | \
++	WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT | \
+ 	WLR_OUTPUT_STATE_RENDER_FORMAT | \
+ 	WLR_OUTPUT_STATE_SUBPIXEL | \
+ 	WLR_OUTPUT_STATE_LAYERS)
+diff --git a/include/wlr/types/wlr_output.h b/include/wlr/types/wlr_output.h
+index 4485b36..886210c 100644
+--- a/include/wlr/types/wlr_output.h
++++ b/include/wlr/types/wlr_output.h
+@@ -77,6 +77,7 @@ enum wlr_output_state_field {
+ 	WLR_OUTPUT_STATE_SIGNAL_TIMELINE = 1 << 11,
+ 	WLR_OUTPUT_STATE_COLOR_TRANSFORM = 1 << 12,
+ 	WLR_OUTPUT_STATE_IMAGE_DESCRIPTION = 1 << 13,
++	WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT = 1 << 14,
+ };
+ 
+ enum wlr_output_state_mode_type {
+@@ -149,6 +150,9 @@ struct wlr_output_state {
+ 		int32_t refresh; // mHz, may be zero
+ 	} custom_mode;
+ 
++	// Override the logical output height (physical px). Use <= 0 to disable.
++	int32_t x1fold_active_height;
++
+ 	struct wlr_output_layer_state *layers;
+ 	size_t layers_len;
+ 
+@@ -502,6 +506,14 @@ void wlr_output_state_set_mode(struct wlr_output_state *state,
+  */
+ void wlr_output_state_set_custom_mode(struct wlr_output_state *state,
+ 	int32_t width, int32_t height, int32_t refresh);
++/**
++ * Override the logical output height (physical px) without changing the
++ * underlying mode. Use <= 0 to disable.
++ *
++ * This state will be applied once wlr_output_commit_state() is called.
++ */
++void wlr_output_state_set_x1fold_active_height(struct wlr_output_state *state,
++	int32_t height);
+ /**
+  * Sets the scale of an output. The scale is used to increase the size of UI
+  * elements to aid users who use high DPI outputs.
+diff --git a/types/ext_image_capture_source_v1/output.c b/types/ext_image_capture_source_v1/output.c
+index 0e3a578..9acbfc5 100644
+--- a/types/ext_image_capture_source_v1/output.c
++++ b/types/ext_image_capture_source_v1/output.c
+@@ -128,7 +128,8 @@ static void source_handle_output_commit(struct wl_listener *listener,
+ 	struct wlr_output_event_commit *event = data;
+ 
+ 	if (event->state->committed & (WLR_OUTPUT_STATE_MODE |
+-			WLR_OUTPUT_STATE_RENDER_FORMAT | WLR_OUTPUT_STATE_ENABLED)) {
++			WLR_OUTPUT_STATE_RENDER_FORMAT | WLR_OUTPUT_STATE_ENABLED |
++			WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT)) {
+ 		source_update_buffer_constraints(source);
+ 	}
+ 
+diff --git a/types/output/output.c b/types/output/output.c
+index 3715950..ee15569 100644
+--- a/types/output/output.c
++++ b/types/output/output.c
+@@ -23,15 +23,8 @@ static void send_geometry(struct wl_resource *resource) {
+ 
+ static void send_current_mode(struct wl_resource *resource) {
+ 	struct wlr_output *output = wlr_output_from_resource(resource);
+-	if (output->current_mode != NULL) {
+-		struct wlr_output_mode *mode = output->current_mode;
+-		wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT,
+-			mode->width, mode->height, mode->refresh);
+-	} else {
+-		// Output has no mode
+-		wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT, output->width,
+-			output->height, output->refresh);
+-	}
++	wl_output_send_mode(resource, WL_OUTPUT_MODE_CURRENT, output->width,
++		output->height, output->refresh);
+ }
+ 
+ static void send_scale(struct wl_resource *resource) {
+@@ -322,6 +315,39 @@ static void output_apply_state(struct wlr_output *output,
+ 		}
+ 	}
+ 
++	if (state->committed & WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT) {
++		int full_width = output->width;
++		int full_height = output->height;
++		int full_refresh = output->refresh;
++		if (output->current_mode != NULL) {
++			full_width = output->current_mode->width;
++			full_height = output->current_mode->height;
++			full_refresh = output->current_mode->refresh;
++		}
++
++		int height = full_height;
++		if (state->x1fold_active_height > 0 &&
++				state->x1fold_active_height < full_height) {
++			height = state->x1fold_active_height;
++		}
++
++		if (output->width != full_width || output->height != height ||
++				output->refresh != full_refresh) {
++			output->width = full_width;
++			output->height = height;
++			output->refresh = full_refresh;
++
++			if (output->swapchain != NULL &&
++					(output->swapchain->width != output->width ||
++					output->swapchain->height != output->height)) {
++				wlr_swapchain_destroy(output->swapchain);
++				output->swapchain = NULL;
++			}
++
++			mode_updated = true;
++		}
++	}
++
+ 	if (geometry_updated || scale_updated || mode_updated) {
+ 		struct wl_resource *resource;
+ 		wl_resource_for_each(resource, &output->resources) {
+@@ -494,17 +520,25 @@ void output_pending_resolution(struct wlr_output *output,
+ 		case WLR_OUTPUT_STATE_MODE_FIXED:
+ 			*width = state->mode->width;
+ 			*height = state->mode->height;
+-			return;
++			break;
+ 		case WLR_OUTPUT_STATE_MODE_CUSTOM:
+ 			*width = state->custom_mode.width;
+ 			*height = state->custom_mode.height;
+-			return;
++			break;
++		default:
++			abort();
+ 		}
+-		abort();
+ 	} else {
+ 		*width = output->width;
+ 		*height = output->height;
+ 	}
++
++	if (state->committed & WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT) {
++		int32_t active_height = state->x1fold_active_height;
++		if (active_height > 0 && active_height < *height) {
++			*height = active_height;
++		}
++	}
+ }
+ 
+ bool output_pending_enabled(struct wlr_output *output,
+@@ -580,6 +614,20 @@ static uint32_t output_compare_state(struct wlr_output *output,
+ 			output->color_transform == state->color_transform) {
+ 		fields |= WLR_OUTPUT_STATE_COLOR_TRANSFORM;
+ 	}
++	if (state->committed & WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT) {
++		int full_height = output->height;
++		if (output->current_mode != NULL) {
++			full_height = output->current_mode->height;
++		}
++		int desired_height = full_height;
++		if (state->x1fold_active_height > 0 &&
++				state->x1fold_active_height < full_height) {
++			desired_height = state->x1fold_active_height;
++		}
++		if (output->height == desired_height) {
++			fields |= WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT;
++		}
++	}
+ 	return fields;
+ }
+ 
+diff --git a/types/output/render.c b/types/output/render.c
+index 155da5c..6483440 100644
+--- a/types/output/render.c
++++ b/types/output/render.c
+@@ -107,6 +107,9 @@ bool output_ensure_buffer(struct wlr_output *output,
+ 	if (state->committed & WLR_OUTPUT_STATE_MODE) {
+ 		needs_new_buffer = true;
+ 	}
++	if (state->committed & WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT) {
++		needs_new_buffer = true;
++	}
+ 	if (state->committed & WLR_OUTPUT_STATE_RENDER_FORMAT) {
+ 		needs_new_buffer = true;
+ 	}
+diff --git a/types/output/state.c b/types/output/state.c
+index f2c655e..30fc2ad 100644
+--- a/types/output/state.c
++++ b/types/output/state.c
+@@ -48,6 +48,13 @@ void wlr_output_state_set_custom_mode(struct wlr_output_state *state,
+ 	state->allow_reconfiguration = true;
+ }
+ 
++void wlr_output_state_set_x1fold_active_height(struct wlr_output_state *state,
++		int32_t height) {
++	state->committed |= WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT;
++	state->x1fold_active_height = height;
++	state->allow_reconfiguration = true;
++}
++
+ void wlr_output_state_set_scale(struct wlr_output_state *state, float scale) {
+ 	state->committed |= WLR_OUTPUT_STATE_SCALE;
+ 	state->scale = scale;
+diff --git a/types/scene/wlr_scene.c b/types/scene/wlr_scene.c
+index 7bc8b76..7fd4555 100644
+--- a/types/scene/wlr_scene.c
++++ b/types/scene/wlr_scene.c
+@@ -1722,7 +1722,7 @@ static void scene_output_handle_commit(struct wl_listener *listener, void *data)
+ 		WLR_OUTPUT_STATE_SUBPIXEL);
+ 
+ 	if (force_update || state->committed & (WLR_OUTPUT_STATE_MODE |
+-			WLR_OUTPUT_STATE_ENABLED)) {
++			WLR_OUTPUT_STATE_ENABLED | WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT)) {
+ 		scene_output_update_geometry(scene_output, force_update);
+ 	}
+ 
+diff --git a/types/wlr_output_layout.c b/types/wlr_output_layout.c
+index ef27511..142b145 100644
+--- a/types/wlr_output_layout.c
++++ b/types/wlr_output_layout.c
+@@ -139,7 +139,7 @@ static void handle_output_commit(struct wl_listener *listener, void *data) {
+ 
+ 	if (event->state->committed & (WLR_OUTPUT_STATE_SCALE |
+ 			WLR_OUTPUT_STATE_TRANSFORM |
+-			WLR_OUTPUT_STATE_MODE)) {
++			WLR_OUTPUT_STATE_MODE | WLR_OUTPUT_STATE_X1FOLD_ACTIVE_HEIGHT)) {
+ 		output_layout_reconfigure(l_output->layout);
+ 		output_update_global(l_output->layout, l_output->output);
+ 	}
